@@ -163,6 +163,14 @@ Core rules:
 6. confidence must be exactly one of: "High", "Medium", "Low".
 7. Echo title and authors exactly as supplied. Do not rewrite or infer metadata.
 
+CRITICAL CONSISTENCY RULE:
+- The verdict and rationale MUST be consistent with each other.
+- If verdict is positive (e.g. "Reasonably reproducible"), the rationale MUST support it with positive evidence.
+- If verdict is negative or "Not enough evidence", the rationale MUST explain what is lacking.
+- NEVER write a positive verdict with a negative rationale like "does not provide sufficient details".
+- NEVER write a negative verdict with a positive rationale.
+- If you cannot write a consistent verdict+rationale pair, use verdict="Not enough evidence".
+
 Anti-hallucination rules:
 - No generic criticism templates.
 - No academic boilerplate.
@@ -178,7 +186,7 @@ Dimension-specific rules:
 - novelty: assess only from the paper's own positioning and contribution claims. Distinguish foundational novelty, incremental extension, engineering or practical innovation, and efficiency innovation. Do not rank overall field impact unless the evidence is explicit.
 - assumptions: only explicit or strongly implied assumptions the method depends on.
 - threats_to_validity: focus on evaluation scope, dataset bias, benchmark coverage, confounders, missing ablations, or stated limitations.
-- reproducibility: require evidence about hyperparameters, setup clarity, architecture detail, datasets or splits, evaluation protocol, implementation details, or code/checkpoint release mentions. Tables and figures alone are not enough.
+- reproducibility: require evidence about hyperparameters, setup clarity, architecture detail, datasets or splits, evaluation protocol, implementation details, or code/checkpoint release mentions. Tables and figures alone are not enough. A positive verdict requires at least 3 of these signals present.
 - fairness_of_comparison: require evidence of baselines, matched tasks or datasets, matched metrics, experimental controls, or fairness caveats. Simply having baselines is not enough.
 - applicability: judge practical usability from compute burden, deployment realism, transferability, task scope, or operational constraints.
 """
@@ -204,9 +212,15 @@ Return one JSON object with EXACTLY these top-level keys:
 
 Each dimension object must contain EXACTLY:
 - "verdict": short judgement string
-- "rationale": 2-4 evidence-grounded sentences
-- "evidence": list of short, specific bullet-like strings
+- "rationale": 2-4 evidence-grounded sentences that MUST be consistent with the verdict
+- "evidence": list of short, specific bullet-like strings (max 5, NO duplicates, NO same metric repeated)
 - "confidence": "High", "Medium", or "Low"
+
+MANDATORY CONSISTENCY:
+- If verdict is positive → rationale must explain WHY it is positive using evidence
+- If verdict is negative or "Not enough evidence" → rationale must explain WHAT is missing
+- NEVER combine a positive verdict with rationale that says "does not provide" or "insufficient"
+- NEVER list the same metric (e.g. same Elo score value) more than once in evidence
 
 If evidence is missing or indirect, use:
 - verdict: "Not enough evidence"
@@ -229,8 +243,11 @@ Evidence Inventory:
 {_build_evidence_inventory(sections)}
 
 Evidence formatting requirements:
+- Each evidence item must be UNIQUE — do not repeat the same number or metric.
 - Prefer evidence like "Evaluates on WikiSQL and Spider", "Reports 4-bit quantization and reduced memory use", "Does not report train/validation/test split details", "Compares against GPTQ and LoRA baselines", "Reports +2.3 BLEU over baseline X".
 - Avoid evidence like "high quality methodology", "thorough analysis", or "fair evaluation metrics used".
+- For reproducibility: list what IS reported (hyperparams, split, code) and what is NOT.
+- For fairness: name the specific baselines compared against, or state they are absent.
 """
 
 

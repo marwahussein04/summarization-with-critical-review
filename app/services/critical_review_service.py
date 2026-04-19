@@ -143,12 +143,22 @@ def _contains_phrase(text: str, phrases: tuple[str, ...]) -> bool:
 
 def _clean_evidence_items(evidence: list[str], limit: int = 5) -> list[str]:
     seen: set[str] = set()
+    seen_numeric_fingerprints: set[str] = set()
     items: list[str] = []
     for item in evidence:
         cleaned = _clean_bullet(item)
         lowered = cleaned.lower()
         if not cleaned or lowered in seen or _contains_phrase(cleaned, GENERIC_PHRASES):
             continue
+        # Deduplicate key-figure style lines (containing "|", "Elo", or "latency")
+        # that share the same leading numeric value to avoid repeating the same metric.
+        if "|" in cleaned or "elo" in lowered or "latency" in lowered:
+            num_match = re.search(r'\b(\d[\d,.]*)\b', lowered)
+            fingerprint = num_match.group(1) if num_match else ""
+            if fingerprint and fingerprint in seen_numeric_fingerprints:
+                continue
+            if fingerprint:
+                seen_numeric_fingerprints.add(fingerprint)
         seen.add(lowered)
         items.append(cleaned)
     specific = [item for item in items if _is_specific_evidence(item)]
@@ -222,7 +232,21 @@ def _fallback_dimension_evidence(dimension: str, sections: PaperSections, limit:
 
     for source in DIMENSION_EVIDENCE_SOURCES.get(dimension, ()):
         if source == "key_figures":
-            for figure in sections.key_figures[:12]:
+            # Only include key_figures whose section or label matches this dimension
+            relevant_sections = {
+                "strengths":             {"results", "abstract"},
+                "weaknesses":            {"limitations"},
+                "novelty":               {"abstract", "introduction"},
+                "assumptions":           {"methodology"},
+                "threats_to_validity":   {"limitations", "results"},
+                "reproducibility":       {"methodology", "results"},
+                "fairness_of_comparison": {"results"},
+                "applicability":         {"results", "conclusion"},
+            }.get(dimension, set())
+            for figure in sections.key_figures[:15]:
+                fig_section = figure.section.lower().strip()
+                if relevant_sections and fig_section not in relevant_sections:
+                    continue
                 text = " | ".join(
                     part for part in (f"{figure.label}: {figure.value}", figure.context, figure.section) if part
                 )
@@ -266,11 +290,13 @@ def _sanitize_title(value: str) -> str:
     title = _safe_first_line(value, "title")
     if not title or title.lower() == NOT_FOUND.lower():
         return NOT_FOUND
-    if len(title) < 8 or len(title) > 260:
+    # Accept any title between 8 and 300 chars (LoRA-style titles with subtitles can be long)
+    if len(title) < 8 or len(title) > 300:
         return NOT_FOUND
     if any(pattern.match(title) for pattern in TITLE_REJECTION_PATTERNS):
         return NOT_FOUND
-    if any(token in title.lower() for token in ("abstract", "introduction", "doi", "http", "arxiv", "@")):
+    # Only reject on truly non-title tokens; colons are fine (e.g. "LoRA: Low-Rank...")
+    if any(token in title.lower() for token in ("doi.org", "http://", "https://", "arxiv.org", "@")):
         return NOT_FOUND
     return title
 
@@ -341,6 +367,25 @@ def _normalize_assessment(
                 "Insufficient explicit evidence on matched datasets, metrics, baselines, or experimental controls to judge fairness confidently.",
             )
         return _make_insufficient(dimension)
+
+    # ── CONSISTENCY CHECK: ensure verdict and rationale are not contradictory ──
+    # If the rationale says "does not provide" or "insufficient" but verdict is positive, reset rationale.
+    rationale_lower = _norm(assessment.rationale or "").lower()
+    verdict_lower   = _norm(assessment.verdict or "").lower()
+    _contradiction_positive_verdicts = (
+        "reasonably reproducible", "comparison setup appears reasonably supported",
+        "high computational efficiency", "effective", "appears stronger",
+    )
+    _contradiction_negative_phrases = (
+        "does not provide sufficient", "does not provide enough",
+        "not enough evidence", "insufficient", "lacks sufficient",
+        "no details", "not mentioned",
+    )
+    verdict_is_positive = any(p in verdict_lower for p in _contradiction_positive_verdicts)
+    rationale_is_negative = any(p in rationale_lower for p in _contradiction_negative_phrases)
+    if verdict_is_positive and rationale_is_negative:
+        # Rebuild rationale from evidence to eliminate the contradiction
+        assessment = assessment.model_copy(update={"rationale": _template_rationale(dimension, evidence)})
 
     if dimension == "novelty":
         novelty_text = _norm(" ".join([text, _source_text(sections)])).lower()
