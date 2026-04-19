@@ -69,8 +69,33 @@ def chat_completion(
             ) from exc
 
         except RateLimitError as exc:
+            # Auto-fallback: try a smaller model before giving up
+            FALLBACK_MODELS = ["llama-3.1-8b-instant", "gemma2-9b-it"]
+            current_model = settings.groq_model
+            for fallback in FALLBACK_MODELS:
+                if fallback == current_model:
+                    continue
+                logger.warning(
+                    "Rate limit hit on %s — auto-retrying with fallback model %s",
+                    current_model, fallback,
+                )
+                try:
+                    response = client.chat.completions.create(
+                        model=fallback,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=0.2,
+                    )
+                    content = response.choices[0].message.content
+                    logger.info("Fallback model %s succeeded.", fallback)
+                    return content or ""
+                except Exception as fallback_exc:
+                    logger.warning("Fallback model %s also failed: %s", fallback, fallback_exc)
+                    continue
             raise LLMServiceError(
-                "Groq rate limit reached. Please wait a moment and try again.", original=exc
+                f"Rate limit reached on {current_model} and all fallback models failed. "
+                f"Please wait ~30 minutes or upgrade your Groq plan.",
+                original=exc,
             ) from exc
 
         except (APIConnectionError, APIStatusError) as exc:

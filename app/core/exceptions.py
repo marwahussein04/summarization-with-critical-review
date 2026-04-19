@@ -36,3 +36,8 @@ class JSONParseError(AppError):
 class ReportGenerationError(AppError):
     """Raised when PDF report generation fails."""
     pass
+
+
+class CriticalReviewError(AppError):
+    """Raised when critical review generation or comparison fails."""
+    pass

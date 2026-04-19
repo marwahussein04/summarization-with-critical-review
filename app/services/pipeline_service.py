@@ -1,81 +1,90 @@
 """
 app/services/pipeline_service.py
-
-Upgraded pipeline:
-  1. marker_service  → PDF → structured markdown + LaTeX equations
-  2. pdf_parser      → cropped figure images + key page renders
-  3. gemini_vision   → accurate figure/equation analysis (Gemini 1.5 Flash)
-     OR groq_vision  → fallback if no Gemini key
-  4. summarizer      → chunked full-paper section extraction (no truncation)
-  5. report_service  → PDF report with rendered equations + cropped figures
+Simple 3-step pipeline: parse → extract sections → summarize → report.
 """
 from __future__ import annotations
-
 import logging
 
 from app.core.config import get_settings
-from app.domain.models import PipelineResult
-from app.services import llm_service, report_service, summarizer_service
+from app.core.exceptions import AppError
+from app.domain.models import CriticalComparisonPipelineResult, PaperSections, PipelineResult
+from app.services import critical_review_service, llm_service, report_service, summarizer_service
 from app.services.marker_service import convert_pdf as marker_convert
-from app.services.pdf_parser import parse_pdf
 
 logger = logging.getLogger(__name__)
 
 
 def run_pipeline(
-    pdf_bytes:  bytes,
-    api_key:    str,
-    model:      str | None = None,
-    use_vision: bool = True,
+    pdf_bytes: bytes,
+    api_key:   str,
+    model:     str | None = None,
+    use_vision: bool = False,
     gemini_key: str = "",
 ) -> PipelineResult:
-    """
-    Full accuracy-maximised pipeline.
+    try:
+        logger.info("Pipeline started (%d bytes)", len(pdf_bytes))
 
-    Args:
-        pdf_bytes:  Raw PDF bytes.
-        api_key:    Groq API key (text LLM).
-        model:      Optional Groq model override.
-        use_vision: Whether to run vision analysis on figures/equations.
-        gemini_key: Google Gemini API key (preferred vision backend).
-                    Falls back to Groq llama-4-scout if empty.
-    """
-    logger.info("Pipeline started (%d bytes)", len(pdf_bytes))
+        settings = get_settings()
+        if model:
+            settings.groq_model = model
 
-    settings = get_settings()
-    if model:
-        settings.groq_model = model
-    # Allow key override from UI even if not in .env
-    if gemini_key:
-        settings.gemini_api_key = gemini_key
+        client = llm_service.create_groq_client(api_key)
 
-    client = llm_service.create_groq_client(api_key)
+        # Step 1: Parse PDF → structured text
+        logger.info("Step 1/3: Parsing PDF...")
+        marker_result = marker_convert(pdf_bytes)
+        logger.info("  %d chars extracted", len(marker_result.full_markdown))
 
-    # ── Step 1: marker conversion ──────────────────────────────────────
-    # Gives us: structured markdown, LaTeX equations, section hints
-    logger.info("Step 1/6: Converting PDF with marker...")
+        # Step 2: Extract sections from text
+        logger.info("Step 2/3: Extracting sections...")
+        sections = summarizer_service.extract_sections(
+            full_text=marker_result.full_text_for_llm,
+            client=client,
+            settings=settings,
+            marker_sections=marker_result.sections,
+        )
+
+        # Fill title/authors from marker if LLM missed them
+        if sections.title == "Not found" and marker_result.title:
+            sections = sections.model_copy(update={"title": marker_result.title})
+        if sections.authors == "Not found" and marker_result.authors:
+            sections = sections.model_copy(update={"authors": marker_result.authors})
+
+        # Step 3: Generate summary
+        logger.info("Step 3/3: Generating summary...")
+        summary_markdown = summarizer_service.generate_summary(sections, client, settings)
+
+        # Build PDF report
+        logger.info("Building report...")
+        report_pdf_bytes = report_service.build_pdf(summary_markdown, sections)
+
+        logger.info("Pipeline complete.")
+        return PipelineResult(
+            sections=sections,
+            summary_markdown=summary_markdown,
+            report_pdf_bytes=report_pdf_bytes,
+        )
+    except AppError:
+        raise
+    except Exception as exc:
+        logger.error("Unhandled pipeline failure: %s: %s", type(exc).__name__, exc, exc_info=True)
+        raise AppError(
+            "Unexpected server error while processing the document. Please try again.",
+            original=exc,
+        ) from exc
+
+
+def _extract_sections_from_pdf(
+    pdf_bytes: bytes,
+    client,
+    settings,
+    paper_label: str,
+) -> PaperSections:
+    logger.info("%s: parsing PDF...", paper_label)
     marker_result = marker_convert(pdf_bytes)
-    logger.info(
-        "  marker: %d chars, %d equations found in text",
-        len(marker_result.full_markdown),
-        len(marker_result.equations),
-    )
+    logger.info("%s: %d chars extracted", paper_label, len(marker_result.full_markdown))
 
-    # ── Step 2: PDF parsing for figure crops + vision key pages ───────
-    logger.info("Step 2/6: Parsing PDF for figures and key pages...")
-    parsed = parse_pdf(pdf_bytes)
-    logger.info(
-        "  %d pages, %d cropped figures, %d key pages",
-        parsed.page_count,
-        len(parsed.all_cropped_figures),
-        len(parsed.key_pages),
-    )
-
-    # ── Step 3: Vision analysis ────────────────────────────────────────
-    vision = _run_vision(parsed, settings, use_vision)
-
-    # ── Step 4: Chunked section extraction from full paper text ────────
-    logger.info("Step 4/6: Extracting sections (chunked, full paper)...")
+    logger.info("%s: extracting sections...", paper_label)
     sections = summarizer_service.extract_sections(
         full_text=marker_result.full_text_for_llm,
         client=client,
@@ -83,83 +92,75 @@ def run_pipeline(
         marker_sections=marker_result.sections,
     )
 
-    # Override title/authors from marker if LLM missed them
-    if sections.title == "Not found" and marker_result.title:
-        sections = sections.model_copy(update={"title": marker_result.title})
-    if sections.authors == "Not found" and marker_result.authors:
-        sections = sections.model_copy(update={"authors": marker_result.authors})
-
-    # ── Step 5: Merge vision + marker equations into sections ──────────
-    logger.info("Step 5/6: Merging vision + marker data...")
-    sections = summarizer_service.enrich_sections_with_vision(sections, vision)
-    sections = summarizer_service.enrich_sections_with_marker(
-        sections, marker_result.equations
+    stable_title, stable_authors = critical_review_service.resolve_stable_metadata(
+        marker_result.title,
+        marker_result.authors,
+        sections.title,
+        sections.authors,
     )
+    sections = sections.model_copy(update={"title": stable_title, "authors": stable_authors})
 
-    # ── Step 6: Generate summary ───────────────────────────────────────
-    logger.info("Step 6/6: Generating enriched summary...")
-    summary_markdown = summarizer_service.generate_summary(sections, client, settings)
-
-    # ── Build report ───────────────────────────────────────────────────
-    logger.info("Building PDF report...")
-    report_pdf_bytes = report_service.build_pdf(summary_markdown, sections)
-
-    logger.info("Pipeline complete.")
-    return PipelineResult(
-        sections=sections,
-        summary_markdown=summary_markdown,
-        report_pdf_bytes=report_pdf_bytes,
-    )
+    return sections
 
 
-def _run_vision(parsed, settings, use_vision: bool):
-    """Select and run the best available vision backend."""
-    from app.services.vision_service import VisionAnalysis as GroqVisionAnalysis
+def run_critical_comparison_pipeline(
+    pdf_a_bytes: bytes,
+    pdf_b_bytes: bytes,
+    api_key: str,
+    model: str | None = None,
+    use_vision: bool = False,
+    gemini_key: str = "",
+) -> CriticalComparisonPipelineResult:
+    del use_vision, gemini_key
 
-    if not use_vision or not parsed.key_pages:
-        logger.info("Step 3/6: Vision skipped.")
-        return GroqVisionAnalysis()
-
-    # Prefer Gemini if key is available
-    if settings.has_gemini:
+    try:
         logger.info(
-            "Step 3/6: Vision with Gemini 1.5 Flash on %d pages...",
-            len(parsed.key_pages),
+            "Critical comparison pipeline started (paper_a=%d bytes, paper_b=%d bytes)",
+            len(pdf_a_bytes),
+            len(pdf_b_bytes),
         )
-        try:
-            from app.services.gemini_vision_service import analyze_key_pages_gemini
-            vision = analyze_key_pages_gemini(
-                key_pages=parsed.key_pages,
-                all_cropped_figures=parsed.all_cropped_figures,
-                gemini_api_key=settings.gemini_api_key,
-            )
-            # Convert to Groq-compatible VisionAnalysis for downstream compatibility
-            return _bridge_vision(vision, GroqVisionAnalysis)
-        except Exception as exc:
-            logger.warning("Gemini vision failed (%s) — falling back to Groq.", exc)
 
-    # Fallback: Groq llama-4-scout
-    logger.info(
-        "Step 3/6: Vision with Groq llama-4-scout on %d pages...",
-        len(parsed.key_pages),
-    )
-    from app.services.vision_service import analyze_key_pages
-    client = llm_service.create_groq_client(settings.groq_api_key)
-    return analyze_key_pages(
-        key_pages=parsed.key_pages,
-        all_cropped_figures=parsed.all_cropped_figures,
-        client=client,
-        settings=settings,
-    )
+        settings = get_settings()
+        if model:
+            settings.groq_model = model
 
+        client = llm_service.create_groq_client(api_key)
 
-def _bridge_vision(src, TargetClass):
-    """
-    Convert between Gemini and Groq VisionAnalysis dataclasses.
-    Both have identical field names so we can copy by attribute.
-    """
-    result = TargetClass()
-    result.figures        = src.figures
-    result.equations      = src.equations
-    result.page_summaries = src.page_summaries
-    return result
+        paper_a_sections = _extract_sections_from_pdf(pdf_a_bytes, client, settings, "Paper A")
+        paper_b_sections = _extract_sections_from_pdf(pdf_b_bytes, client, settings, "Paper B")
+
+        logger.info("Generating critical profiles for both papers...")
+        paper_a_profile = critical_review_service.generate_paper_critical_profile(
+            paper_a_sections, client, settings
+        )
+        paper_b_profile = critical_review_service.generate_paper_critical_profile(
+            paper_b_sections, client, settings
+        )
+
+        logger.info("Generating direct pairwise comparison...")
+        result = critical_review_service.generate_critical_comparison(
+            paper_a_profile,
+            paper_b_profile,
+            client,
+            settings,
+        )
+
+        logger.info("Critical comparison pipeline complete.")
+        return CriticalComparisonPipelineResult(
+            paper_a_sections=paper_a_sections,
+            paper_b_sections=paper_b_sections,
+            result=result,
+        )
+    except AppError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Unhandled critical comparison pipeline failure: %s: %s",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise AppError(
+            "Unexpected server error while comparing the documents. Please try again.",
+            original=exc,
+        ) from exc

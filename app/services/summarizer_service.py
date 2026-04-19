@@ -2,9 +2,10 @@
 app/services/summarizer_service.py
 
 AI business logic — now with:
-  1. Full-paper chunked extraction (no 6000-char cutoff)
-  2. marker-derived section pre-seeding (equations already in LaTeX)
-  3. Vision enrichment (Gemini or Groq)
+  1. Full-paper chunked extraction (no truncation)
+  2. key_figures extraction: all numeric findings per chunk, merged and deduplicated
+  3. marker-derived section pre-seeding
+  4. Vision enrichment (Gemini or Groq)
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ import logging
 from groq import Groq
 
 from app.core.config import Settings
-from app.domain.models import PaperSections, ExtractedEquation, ExtractedFigure
+from app.domain.models import PaperSections, ExtractedEquation, ExtractedFigure, KeyFigure
 from app.prompts.section_extraction import (
     build_section_extraction_system_prompt,
     build_section_extraction_user_prompt,
@@ -29,7 +30,6 @@ from app.utils.text import strip_code_fences
 
 logger = logging.getLogger(__name__)
 
-# Accept VisionAnalysis from either vision backend
 try:
     from app.services.gemini_vision_service import VisionAnalysis
 except ImportError:
@@ -43,18 +43,11 @@ def extract_sections(
     marker_sections: dict[str, str] | None = None,
 ) -> PaperSections:
     """
-    Extract structured sections from the full paper text.
+    Extract structured sections + key numeric figures from the full paper text.
 
     If the text fits in one LLM call: send directly.
     If not: chunk it, extract from each chunk, merge results.
-    marker_sections (from marker_service) are used to pre-seed
-    the extraction — the LLM fills gaps rather than starting cold.
-
-    Args:
-        full_text:        Complete paper text (can be very long).
-        client:           Groq client.
-        settings:         App settings.
-        marker_sections:  Optional dict from marker_service._split_into_sections.
+    key_figures are collected from ALL chunks and deduplicated.
     """
     system_prompt = build_section_extraction_system_prompt()
     chunks        = chunk_text(full_text)
@@ -65,7 +58,6 @@ def extract_sections(
     raw_dicts: list[dict] = []
 
     for chunk in chunks:
-        # Build prompt — include marker pre-seeding hint on first chunk
         hint = ""
         if marker_sections and chunk.index == 0:
             hint = _build_marker_hint(marker_sections)
@@ -84,7 +76,9 @@ def extract_sections(
         try:
             data = json.loads(cleaned)
             raw_dicts.append(data)
-            logger.debug("  Chunk %d/%d extracted OK.", chunk.index + 1, len(chunks))
+            n_kf = len(data.get("key_figures", []))
+            logger.debug("  Chunk %d/%d extracted OK. key_figures: %d",
+                         chunk.index + 1, len(chunks), n_kf)
         except json.JSONDecodeError as exc:
             logger.warning("  Chunk %d JSON parse failed: %s", chunk.index + 1, exc)
 
@@ -94,15 +88,12 @@ def extract_sections(
 
     merged = merge_section_dicts(raw_dicts)
     sections = PaperSections.from_dict(merged)
-    logger.info("Sections merged. Title: %s", sections.title)
+    logger.info("Sections merged. Title: %s | Key figures: %d",
+                sections.title, len(sections.key_figures))
     return sections
 
 
 def _build_marker_hint(marker_sections: dict[str, str]) -> str:
-    """
-    Build a hint string from marker's pre-extracted sections.
-    The LLM uses this to avoid re-deriving things that marker already found.
-    """
     non_empty = {k: v[:400] for k, v in marker_sections.items() if v.strip()}
     if not non_empty:
         return ""
@@ -147,22 +138,18 @@ def enrich_sections_with_marker(
 ) -> PaperSections:
     """
     Add equations that marker found in the PDF text (LaTeX blocks).
-    These are merged with any vision-extracted equations (vision wins for
-    equations it found; marker fills the gaps).
-
     Only adds marker equations if vision found fewer than marker did.
     """
     if not marker_equations:
         return sections
 
-    # Keep existing vision equations, add marker extras (deduplicated)
     existing_latex = {eq.latex.strip() for eq in sections.equations}
 
     extras: list[ExtractedEquation] = []
     for meq in marker_equations:
         if meq.latex.strip() not in existing_latex and meq.is_block:
             extras.append(ExtractedEquation(
-                page_number=0,           # page unknown from text extraction
+                page_number=0,
                 latex=meq.latex,
                 description=meq.context or "Equation from paper body",
             ))

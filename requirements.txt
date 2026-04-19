@@ -14,3 +14,4 @@ matplotlib>=3.7.0       # equation rendering (mathtext)
 
 # Gemini vision (no SDK needed — uses urllib only)
 # Get free key: https://aistudio.google.com/app/apikey
+reportlab

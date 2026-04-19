@@ -1,79 +1,68 @@
 """
 app/services/report_service.py
 
-Clean, well-organised PDF report generator.
-
-Structure:
-  ┌─────────────────────────────┐
-  │  COVER PAGE                 │  title, authors, date, stats
-  ├─────────────────────────────┤
-  │  AT-A-GLANCE                │  abstract + key facts table
-  ├─────────────────────────────┤
-  │  OVERVIEW SECTIONS          │  summary markdown, rendered inline
-  │  (equations as images)      │
-  ├─────────────────────────────┤
-  │  FIGURES REFERENCE          │  page images + captions
-  ├─────────────────────────────┤
-  │  EQUATIONS REFERENCE        │  rendered equation images + descriptions
-  └─────────────────────────────┘
+Clean, well-structured PDF report.
+Cover → Abstract → Section summaries (one per page section, clear headings).
+Nothing else.
 """
 from __future__ import annotations
 
-import base64
 import io
 import logging
 import re
 from datetime import datetime
-from typing import Callable
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import (
-    BaseDocTemplate,
-    Frame,
-    Image,
-    KeepTogether,
-    NextPageTemplate,
-    PageBreak,
-    PageTemplate,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    HRFlowable,
-    Table,
-    TableStyle,
+    PageBreak, Paragraph, SimpleDocTemplate,
+    Spacer, HRFlowable, Table, TableStyle,
 )
 
 from app.core.config import get_settings
 from app.core.exceptions import ReportGenerationError
-from app.domain.models import ExtractedEquation, ExtractedFigure, PaperSections
-from app.utils.equation_renderer import latex_to_png
+from app.domain.models import PaperSections
 from app.utils.text import markdown_bold_to_html, safe_html
 
 logger = logging.getLogger(__name__)
 
-# ── Page geometry ────────────────────────────────────────────────────────────
 PAGE_W, PAGE_H = LETTER
-MARGIN        = 0.85 * inch
-CONTENT_W     = PAGE_W - 2 * MARGIN
+MARGIN    = 1.0 * inch
+CONTENT_W = PAGE_W - 2 * MARGIN
 
-# ── Brand colours ────────────────────────────────────────────────────────────
-C_NAVY   = colors.HexColor("#0f2557")
-C_BLUE   = colors.HexColor("#2563eb")
-C_LBLUE  = colors.HexColor("#dbeafe")
-C_STEEL  = colors.HexColor("#64748b")
-C_RULE   = colors.HexColor("#e2e8f0")
-C_EQBG   = colors.HexColor("#f8faff")
-C_TEXT   = colors.HexColor("#1e293b")
-C_WHITE  = colors.white
+# Colours
+C_NAVY  = colors.HexColor("#0f2557")
+C_BLUE  = colors.HexColor("#2563eb")
+C_LBLUE = colors.HexColor("#dbeafe")
+C_STEEL = colors.HexColor("#64748b")
+C_RULE  = colors.HexColor("#e2e8f0")
+C_TEXT  = colors.HexColor("#1e293b")
+C_WHITE = colors.white
 
+# One accent colour per section heading
+SECTION_COLORS = {
+    # original sections
+    "Overview":                      colors.HexColor("#0f2557"),
+    "Introduction":                  colors.HexColor("#2563eb"),
+    "Methodology":                   colors.HexColor("#0d9488"),
+    "Results":                       colors.HexColor("#16a34a"),
+    "Conclusion":                    colors.HexColor("#7c3aed"),
+    "Limitations":                   colors.HexColor("#dc2626"),
+    "Future Work":                   colors.HexColor("#d97706"),
+    # new comprehensive sections
+    "Problem Statement & Motivation": colors.HexColor("#2563eb"),
+    "Proposed Approach & Methodology": colors.HexColor("#0d9488"),
+    "Experimental Results & Analysis": colors.HexColor("#16a34a"),
+    "Contributions & Conclusions":    colors.HexColor("#7c3aed"),
+    "Limitations & Constraints":      colors.HexColor("#dc2626"),
+    "Future Work & Open Problems":    colors.HexColor("#d97706"),
+    "Key Statistics & Metrics":       colors.HexColor("#0f766e"),
+    "Notable Equations":              colors.HexColor("#7e22ce"),
+}
 
-# ════════════════════════════════════════════════════════════════════════════
-# STYLES
-# ════════════════════════════════════════════════════════════════════════════
 
 def _styles() -> dict:
     base = getSampleStyleSheet()
@@ -83,467 +72,262 @@ def _styles() -> dict:
         return ParagraphStyle(name, parent=parent, **kw)
 
     return {
-        # Cover
-        "cover_title":   _p("CoverTitle",   fontSize=24, textColor=C_NAVY,
+        "cover_title":   _p("CT", fontSize=24, textColor=C_NAVY,
                               fontName="Helvetica-Bold", leading=30,
-                              alignment=TA_CENTER, spaceAfter=8),
-        "cover_authors": _p("CoverAuthors", fontSize=11, textColor=C_STEEL,
-                              alignment=TA_CENTER, spaceAfter=4),
-        "cover_meta":    _p("CoverMeta",    fontSize=9,  textColor=C_STEEL,
-                              alignment=TA_CENTER, spaceAfter=2),
-        "cover_stat":    _p("CoverStat",    fontSize=10, textColor=C_NAVY,
-                              alignment=TA_CENTER, fontName="Helvetica-Bold"),
-
-        # Section headings
-        "h1": _p("H1", fontSize=15, textColor=C_NAVY, fontName="Helvetica-Bold",
-                  spaceBefore=18, spaceAfter=6, leading=20),
-        "h2": _p("H2", fontSize=12, textColor=C_BLUE, fontName="Helvetica-Bold",
-                  spaceBefore=12, spaceAfter=4, leading=16),
-        "h3": _p("H3", fontSize=10, textColor=C_NAVY, fontName="Helvetica-Bold",
-                  spaceBefore=8,  spaceAfter=3, leading=14),
-
-        # Body
-        "body":   _p("Body",   fontSize=10, leading=16, spaceAfter=6,
-                      textColor=C_TEXT, alignment=TA_JUSTIFY),
-        "bullet": _p("Bullet", fontSize=10, leading=15, spaceAfter=4,
-                      textColor=C_TEXT, leftIndent=16, firstLineIndent=0),
-        "italic": _p("Italic", fontSize=9,  leading=13, spaceAfter=4,
-                      textColor=C_STEEL, fontName="Helvetica-Oblique"),
-
-        # Equation caption
-        "eq_label": _p("EqLabel", fontSize=9, textColor=C_BLUE,
-                        fontName="Helvetica-Bold", spaceAfter=2),
-        "eq_where": _p("EqWhere", fontSize=9, leading=13, spaceAfter=8,
-                        textColor=C_STEEL, leftIndent=12,
-                        fontName="Helvetica-Oblique"),
-
-        # Figure caption
-        "fig_caption": _p("FigCaption", fontSize=9, leading=13,
-                           alignment=TA_CENTER, textColor=C_STEEL,
-                           fontName="Helvetica-Oblique", spaceAfter=14),
-
-        # Abstract box
-        "abstract": _p("Abstract", fontSize=10, leading=16, spaceAfter=0,
-                        textColor=C_TEXT, alignment=TA_JUSTIFY),
-
-        # Footer
-        "footer": _p("Footer", fontSize=8, textColor=C_STEEL, alignment=TA_CENTER),
+                              alignment=TA_CENTER, spaceAfter=12),
+        "cover_authors": _p("CA", fontSize=11, textColor=C_STEEL,
+                              alignment=TA_CENTER, spaceAfter=6),
+        "cover_meta":    _p("CM", fontSize=9,  textColor=C_STEEL,
+                              alignment=TA_CENTER),
+        "section_head":  _p("SH", fontSize=14, textColor=C_NAVY,
+                              fontName="Helvetica-Bold",
+                              spaceBefore=6, spaceAfter=4, leading=18),
+        "body":          _p("BD", fontSize=10, leading=17, spaceAfter=8,
+                              textColor=C_TEXT, alignment=TA_JUSTIFY),
+        "bullet":        _p("BL", fontSize=10, leading=16, spaceAfter=5,
+                              textColor=C_TEXT, leftIndent=16),
+        "abstract":      _p("AB", fontSize=10, leading=17, spaceAfter=0,
+                              textColor=C_TEXT, alignment=TA_JUSTIFY),
+        "footer":        _p("FT", fontSize=8,  textColor=C_STEEL,
+                              alignment=TA_CENTER),
+        "table_header":  _p("TH", fontSize=9,  textColor=C_WHITE,
+                              fontName="Helvetica-Bold", leading=13),
+        "table_cell":    _p("TC", fontSize=9,  textColor=C_TEXT, leading=13),
+        "table_value":   _p("TV", fontSize=9,  textColor=colors.HexColor("#0f766e"),
+                              fontName="Helvetica-Bold", leading=13),
+        "eq":            _p("EQ", fontSize=9,  textColor=colors.HexColor("#7e22ce"),
+                              fontName="Courier", leading=14, leftIndent=12),
     }
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# CANVAS CALLBACKS  (header bar + footer)
-# ════════════════════════════════════════════════════════════════════════════
+# ── Canvas callbacks ──────────────────────────────────────────────────────────
 
-def _draw_header_bar(canvas, doc, title: str) -> None:
-    """Thin navy bar across the top of every page except the cover."""
-    canvas.saveState()
-    bar_h = 0.25 * inch
-    canvas.setFillColor(C_NAVY)
-    canvas.rect(0, PAGE_H - bar_h, PAGE_W, bar_h, fill=1, stroke=0)
-    canvas.setFont("Helvetica", 7)
-    canvas.setFillColor(C_WHITE)
-    canvas.drawString(MARGIN, PAGE_H - bar_h + 5, title[:90])
-    canvas.restoreState()
-
-
-def _draw_footer(canvas, doc, author: str) -> None:
+def _on_cover(canvas, doc, author):
     canvas.saveState()
     canvas.setFont("Helvetica", 7)
     canvas.setFillColor(C_STEEL)
-    ts = datetime.now().strftime("%Y-%m-%d")
-    canvas.drawString(MARGIN, 0.4 * inch, f"AI-generated overview  ·  {author}  ·  {ts}")
+    canvas.drawCentredString(PAGE_W / 2, 0.4 * inch,
+                             f"AI-generated summary  ·  {author}  ·  "
+                             f"{datetime.now().strftime('%B %d, %Y')}")
+    canvas.restoreState()
+
+
+def _on_page(canvas, doc, title, author):
+    canvas.saveState()
+    # Top navy bar
+    canvas.setFillColor(C_NAVY)
+    canvas.rect(0, PAGE_H - 0.22 * inch, PAGE_W, 0.22 * inch, fill=1, stroke=0)
+    canvas.setFont("Helvetica", 7)
+    canvas.setFillColor(C_WHITE)
+    canvas.drawString(MARGIN, PAGE_H - 0.15 * inch, title[:90])
+    # Footer
+    canvas.setFont("Helvetica", 7)
+    canvas.setFillColor(C_STEEL)
+    canvas.drawString(MARGIN, 0.4 * inch,
+                      f"AI-generated summary  ·  {author}  ·  "
+                      f"{datetime.now().strftime('%Y-%m-%d')}")
     canvas.drawRightString(PAGE_W - MARGIN, 0.4 * inch, f"Page {doc.page}")
     canvas.restoreState()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# COVER PAGE
-# ════════════════════════════════════════════════════════════════════════════
+# ── Cover page ────────────────────────────────────────────────────────────────
 
-def _cover_page(sections: PaperSections, styles: dict) -> list:
-    story = []
-
-    # Top spacer  (push content to vertical center)
-    story.append(Spacer(1, 1.8 * inch))
-
-    # Navy accent bar above title
-    story.append(HRFlowable(width="100%", thickness=4, color=C_NAVY, spaceAfter=16))
-
-    story.append(Paragraph(safe_html(sections.title), styles["cover_title"]))
-    story.append(Spacer(1, 6))
-    story.append(Paragraph(safe_html(sections.authors), styles["cover_authors"]))
-    story.append(Spacer(1, 4))
+def _cover(sections: PaperSections, st: dict) -> list:
+    story = [Spacer(1, 1.8 * inch)]
+    story.append(HRFlowable(width="100%", thickness=4, color=C_NAVY, spaceAfter=20))
+    story.append(Paragraph(safe_html(sections.title), st["cover_title"]))
+    story.append(Paragraph(safe_html(sections.authors), st["cover_authors"]))
     story.append(Paragraph(
-        f"AI Research Overview  ·  Generated {datetime.now().strftime('%B %d, %Y')}",
-        styles["cover_meta"],
+        f"Research Paper Summary  ·  {datetime.now().strftime('%B %d, %Y')}",
+        st["cover_meta"],
     ))
-
-    story.append(HRFlowable(width="100%", thickness=1, color=C_RULE, spaceAfter=20))
-
-    # Stats table  (equations | figures | pages)
-    n_eq  = len(sections.equations)
-    n_fig = len(sections.figures)
-    rows = [[
-        Paragraph(f"<b>{n_eq}</b><br/>Equations", styles["cover_stat"]),
-        Paragraph(f"<b>{n_fig}</b><br/>Figures",   styles["cover_stat"]),
-    ]]
-    tbl = Table(rows, colWidths=[CONTENT_W / 2] * 2)
-    tbl.setStyle(TableStyle([
-        ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",  (0, 0), (-1, -1), 12),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
-        ("LINEAFTER",   (0, 0), (0, -1), 0.5, C_RULE),
-    ]))
-    story.append(tbl)
-
+    story.append(Spacer(1, 16))
+    story.append(HRFlowable(width="100%", thickness=1, color=C_RULE))
     story.append(PageBreak())
     return story
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# AT-A-GLANCE  (abstract box)
-# ════════════════════════════════════════════════════════════════════════════
+# ── Abstract box ──────────────────────────────────────────────────────────────
 
-def _at_a_glance(sections: PaperSections, styles: dict) -> list:
+def _abstract(sections: PaperSections, st: dict) -> list:
+    if not sections.abstract or sections.abstract == "Not found":
+        return []
     story = []
-    story.append(Paragraph("At a Glance", styles["h1"]))
-    story.append(HRFlowable(width="100%", thickness=1.5, color=C_NAVY, spaceAfter=10))
-
-    abstract_text = safe_html(sections.abstract) if sections.abstract != "Not found" else ""
-    if abstract_text:
-        # Light-blue framed abstract box using a 1-cell table
-        cell = Paragraph(abstract_text, styles["abstract"])
-        box = Table([[cell]], colWidths=[CONTENT_W])
-        box.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, -1), C_LBLUE),
-            ("TOPPADDING",    (0, 0), (-1, -1), 10),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 14),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 14),
-            ("LINEABOVE",     (0, 0), (-1, 0),  3, C_BLUE),
-            ("BOX",           (0, 0), (-1, -1), 0.5, C_RULE),
-        ]))
-        story.append(box)
-        story.append(Spacer(1, 14))
-
+    story.extend(_section_header("Abstract", C_NAVY, st))
+    cell = Paragraph(safe_html(sections.abstract), st["abstract"])
+    box  = Table([[cell]], colWidths=[CONTENT_W])
+    box.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), C_LBLUE),
+        ("TOPPADDING",    (0, 0), (-1, -1), 12),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 14),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 14),
+        ("LINEABOVE",     (0, 0), (-1,  0),  3, C_BLUE),
+        ("BOX",           (0, 0), (-1, -1), 0.5, C_RULE),
+    ]))
+    story.append(box)
+    story.append(Spacer(1, 20))
     return story
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# MARKDOWN → FLOWABLES
-# ════════════════════════════════════════════════════════════════════════════
+# ── Section header helper ─────────────────────────────────────────────────────
 
-_BLOCK_EQ_RE = re.compile(r'^\$\$(.+?)\$\$$', re.DOTALL)
-_INLINE_EQ_RE = re.compile(r'\$([^$\n]+)\$')
+def _section_header(title: str, colour, st: dict) -> list:
+    return [
+        Spacer(1, 8),
+        Paragraph(safe_html(title), st["section_head"]),
+        HRFlowable(width="100%", thickness=2, color=colour, spaceAfter=8),
+    ]
 
 
-def _render_eq_image(latex: str, fontsize: int = 14) -> Image | None:
-    """Return a ReportLab Image of a rendered equation, or None on failure."""
-    png = latex_to_png(latex, fontsize=fontsize)
-    if not png:
-        return None
-    buf = io.BytesIO(png)
-    # Measure natural size then cap width
-    img = Image(buf)
-    nat_w, nat_h = img.drawWidth, img.drawHeight
-    max_w = CONTENT_W - 0.4 * inch   # leave indent
-    if nat_w > max_w:
-        scale = max_w / nat_w
-        img.drawWidth  = max_w
-        img.drawHeight = nat_h * scale
-    return img
+# ── Key statistics table ──────────────────────────────────────────────────────
+
+def _key_stats(sections: PaperSections, st: dict) -> list:
+    """Render an extracted key_figures table in the PDF report."""
+    from app.domain.models import KeyFigure  # local import to avoid circularity
+    if not sections.key_figures:
+        return []
+
+    story: list = []
+    story.extend(_section_header("Key Statistics & Metrics",
+                                 colors.HexColor("#0f766e"), st))
+
+    col_w = [CONTENT_W * 0.28, CONTENT_W * 0.18, CONTENT_W * 0.54]
+    rows = [
+        [
+            Paragraph("Metric",  st["table_header"]),
+            Paragraph("Value",   st["table_header"]),
+            Paragraph("Context", st["table_header"]),
+        ]
+    ]
+    for kf in sections.key_figures[:30]:
+        rows.append([
+            Paragraph(safe_html(kf.label),   st["table_cell"]),
+            Paragraph(safe_html(kf.value),   st["table_value"]),
+            Paragraph(safe_html(kf.context[:160] if kf.context else ""), st["table_cell"]),
+        ])
+
+    tbl = Table(rows, colWidths=col_w, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        # Header row
+        ("BACKGROUND",    (0, 0), (-1,  0), colors.HexColor("#0f766e")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.HexColor("#f0fdf4"), colors.HexColor("#dcfce7")]),
+        ("GRID",          (0, 0), (-1, -1), 0.4, colors.HexColor("#bbf7d0")),
+        ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 7),
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+    ]))
+    story.append(tbl)
+    story.append(Spacer(1, 18))
+    return story
+
+
+# ── Notable equations section ─────────────────────────────────────────────────
+
+def _equations_section(sections: PaperSections, st: dict) -> list:
+    if not sections.equations:
+        return []
+    story: list = []
+    story.extend(_section_header("Notable Equations",
+                                 colors.HexColor("#7e22ce"), st))
+    for eq in sections.equations[:8]:
+        label = f"p.{eq.page_number} — {safe_html(eq.description)}"
+        story.append(Paragraph(label, st["table_cell"]))
+        story.append(Paragraph(safe_html(eq.latex), st["eq"]))
+        story.append(Spacer(1, 6))
+    story.append(Spacer(1, 12))
+    return story
+
+
+# ── Markdown → flowables ──────────────────────────────────────────────────────
+
+_INLINE_EQ = re.compile(r'\$([^$\n]+)\$')
 
 
 def _inline_eq(text: str) -> str:
-    """Replace $...$ with styled monospace spans for ReportLab."""
-    return _INLINE_EQ_RE.sub(
-        lambda m: (
-            f'<font name="Courier" color="#0f2557">'
-            f'{safe_html(m.group(1))}'
-            f'</font>'
-        ),
+    return _INLINE_EQ.sub(
+        lambda m: f'<font name="Courier" color="#0f2557">{safe_html(m.group(1))}</font>',
         text,
     )
 
 
-def _parse_markdown(summary: str, styles: dict) -> list:
-    """Convert markdown summary → ReportLab flowables.
-
-    Handles: ## h2, ### h3, - bullets, $$block eq$$, $inline$, **bold**, plain body.
-    Block equations are rendered as images (via matplotlib); inline as Courier spans.
-    """
+def _parse(summary: str, st: dict) -> list:
     story = []
-    lines = summary.splitlines()
-    i = 0
-    while i < len(lines):
-        raw  = lines[i]
+    for raw in summary.splitlines():
         line = raw.strip()
-        i   += 1
 
-        # ── blank ──────────────────────────────────────────────────
         if not line:
             story.append(Spacer(1, 4))
             continue
 
-        # ── Section heading h2 ──────────────────────────────────────
+        # ## Section heading
         if line.startswith("## "):
-            story.append(Spacer(1, 6))
-            story.append(Paragraph(safe_html(line[3:]), styles["h1"]))
-            story.append(HRFlowable(width="100%", thickness=1,
-                                    color=C_RULE, spaceAfter=6))
+            title = line[3:].strip()
+            # Strip leading emoji for colour lookup
+            clean = re.sub(r'^[\U00010000-\U0010ffff\u2600-\u27BF\uFE00-\uFE0F]+\s*', '', title)
+            colour = SECTION_COLORS.get(clean.strip(), C_NAVY)
+            story.append(Spacer(1, 10))
+            items = _section_header(title, colour, st)
+            story.extend(items)
             continue
 
-        # ── Sub-heading h3 ──────────────────────────────────────────
-        if line.startswith("### "):
-            story.append(Paragraph(safe_html(line[4:]), styles["h2"]))
-            continue
-
-        # ── Block equation  $$...$$  (may span multiple lines) ──────
-        if line.startswith("$$"):
-            latex_lines = [line[2:]]
-            while i < len(lines):
-                nxt = lines[i].strip()
-                i  += 1
-                if nxt.endswith("$$"):
-                    latex_lines.append(nxt[:-2])
-                    break
-                latex_lines.append(nxt)
-            latex = " ".join(latex_lines).strip()
-            eq_img = _render_eq_image(latex, fontsize=14)
-            if eq_img:
-                eq_img.hAlign = "CENTER"
-                block = Table(
-                    [[eq_img]],
-                    colWidths=[CONTENT_W],
-                )
-                block.setStyle(TableStyle([
-                    ("BACKGROUND",    (0, 0), (-1, -1), C_EQBG),
-                    ("TOPPADDING",    (0, 0), (-1, -1), 10),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-                    ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-                    ("BOX",           (0, 0), (-1, -1), 0.5, C_RULE),
-                ]))
-                story.append(block)
-            else:
-                # Fallback: styled text
-                story.append(Paragraph(
-                    f'<font name="Courier" color="#0f2557">{safe_html(latex)}</font>',
-                    styles["body"],
-                ))
-            story.append(Spacer(1, 4))
-            continue
-
-        # ── Bullet point ─────────────────────────────────────────────
+        # Bullet
         if line.startswith(("- ", "* ")):
-            content = line[2:]
-            content = markdown_bold_to_html(_inline_eq(safe_html(content)))
-            story.append(Paragraph(f"• {content}", styles["bullet"]))
+            content = markdown_bold_to_html(_inline_eq(safe_html(line[2:])))
+            story.append(Paragraph(f"• {content}", st["bullet"]))
             continue
 
-        # ── Italic line (starts/ends with *) ─────────────────────────
-        if line.startswith("*") and line.endswith("*") and not line.startswith("**"):
-            inner = safe_html(line.strip("*"))
-            story.append(Paragraph(f"<i>{inner}</i>", styles["italic"]))
-            continue
-
-        # ── Plain body text ──────────────────────────────────────────
+        # Body paragraph
         content = markdown_bold_to_html(_inline_eq(safe_html(line)))
-        story.append(Paragraph(content, styles["body"]))
+        story.append(Paragraph(content, st["body"]))
 
     return story
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# FIGURES REFERENCE SECTION
-# ════════════════════════════════════════════════════════════════════════════
-
-def _figures_section(figures: list[ExtractedFigure], styles: dict) -> list:
-    """Inline figures — only renders figures that have an actual cropped image."""
-    visible = [f for f in figures if f.png_b64]
-    if not visible:
-        return []
-
-    story = [
-        Spacer(1, 8),
-        Paragraph("📈 Visual Evidence", styles["h1"]),
-        HRFlowable(width="100%", thickness=1, color=C_RULE, spaceAfter=12),
-    ]
-
-    MAX_FIG_W = CONTENT_W
-    MAX_FIG_H = 3.2 * inch
-
-    for idx, fig in enumerate(visible, 1):
-        elements: list = []
-        try:
-            img_bytes = base64.b64decode(fig.png_b64)
-            img = Image(io.BytesIO(img_bytes))
-            nat_w, nat_h = img.drawWidth, img.drawHeight
-            scale = min(MAX_FIG_W / nat_w, MAX_FIG_H / nat_h, 1.0)
-            img.drawWidth  = nat_w * scale
-            img.drawHeight = nat_h * scale
-            img.hAlign     = "CENTER"
-            box = Table([[img]], colWidths=[CONTENT_W])
-            box.setStyle(TableStyle([
-                ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-                ("TOPPADDING",    (0, 0), (-1, -1), 12),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
-                ("BACKGROUND",    (0, 0), (-1, -1), colors.HexColor("#f8faff")),
-                ("BOX",           (0, 0), (-1, -1), 0.5, C_RULE),
-                ("LINEABOVE",     (0, 0), (-1,  0), 2,   C_BLUE),
-            ]))
-            elements.append(box)
-        except Exception as exc:
-            logger.warning("Could not embed figure %d: %s", idx, exc)
-            continue
-        caption = safe_html(fig.caption or f"Figure {idx}")
-        desc    = safe_html(fig.description or "")
-        cap_text = f"<b>{caption}</b>"
-        if desc:
-            cap_text += f"<br/><i>{desc}</i>"
-        elements.append(Paragraph(cap_text, styles["fig_caption"]))
-        elements.append(Spacer(1, 16))
-        story.append(KeepTogether(elements))
-
-    return story
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# EQUATIONS REFERENCE SECTION
-# ════════════════════════════════════════════════════════════════════════════
-
-def _equations_section(equations: list[ExtractedEquation], styles: dict) -> list:
-    if not equations:
-        return []
-
-    story = [
-        PageBreak(),
-        Paragraph("Equations Reference", styles["h1"]),
-        HRFlowable(width="100%", thickness=1.5, color=C_NAVY, spaceAfter=14),
-    ]
-
-    for idx, eq in enumerate(equations, 1):
-        elements: list = []
-
-        # Label
-        label = f"Eq. {idx}  (page {eq.page_number})"
-        elements.append(Paragraph(label, styles["eq_label"]))
-
-        # Rendered equation image inside a shaded box
-        eq_img = _render_eq_image(eq.latex, fontsize=15)
-        if eq_img:
-            eq_img.hAlign = "CENTER"
-            box = Table([[eq_img]], colWidths=[CONTENT_W])
-            box.setStyle(TableStyle([
-                ("BACKGROUND",    (0, 0), (-1, -1), C_EQBG),
-                ("TOPPADDING",    (0, 0), (-1, -1), 12),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
-                ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-                ("BOX",           (0, 0), (-1, -1), 0.5, C_RULE),
-                ("LINEABOVE",     (0, 0), (-1, 0),  2,   C_BLUE),
-            ]))
-            elements.append(box)
-        else:
-            # Fallback: styled Courier text
-            elements.append(Paragraph(
-                f'<font name="Courier" color="#0f2557" size="10">'
-                f'{safe_html(eq.latex)}</font>',
-                styles["body"],
-            ))
-
-        # Description
-        if eq.description:
-            elements.append(Paragraph(
-                f"<i>{safe_html(eq.description)}</i>",
-                styles["eq_where"],
-            ))
-
-        elements.append(Spacer(1, 10))
-        story.append(KeepTogether(elements))
-
-    return story
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# PUBLIC API
-# ════════════════════════════════════════════════════════════════════════════
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def build_pdf(summary: str, sections: PaperSections) -> bytes:
-    """Build a clean, well-organised PDF overview report.
-
-    Layout:
-      Cover → At-a-Glance → Overview sections → Figures ref → Equations ref
-
-    Args:
-        summary: Markdown string from the LLM.
-        sections: Enriched PaperSections (may include equations/figures).
-
-    Returns:
-        PDF as raw bytes.
-    """
     settings = get_settings()
-    st = _styles()
+    st  = _styles()
     buf = io.BytesIO()
 
-    # Short title for header bar
-    short_title = (sections.title[:80] + "…") \
-        if len(sections.title) > 80 else sections.title
-
-    def on_cover(canvas, doc):
-        # Plain white cover — no header bar
-        _draw_footer(canvas, doc, settings.report_author)
-
-    def on_content(canvas, doc):
-        _draw_header_bar(canvas, doc, short_title)
-        _draw_footer(canvas, doc, settings.report_author)
+    short = (sections.title[:80] + "…") if len(sections.title) > 80 else sections.title
 
     try:
         doc = SimpleDocTemplate(
-            buf,
-            pagesize=LETTER,
+            buf, pagesize=LETTER,
             leftMargin=MARGIN, rightMargin=MARGIN,
-            topMargin=MARGIN + 0.2 * inch,  # room for header bar
+            topMargin=MARGIN + 0.25 * inch,
             bottomMargin=MARGIN,
         )
 
         story: list = []
+        story.extend(_cover(sections, st))
+        story.extend(_abstract(sections, st))
+        story.extend(_key_stats(sections, st))
+        story.extend(_equations_section(sections, st))
+        story.extend(_parse(summary, st))
 
-        # ── 1. Cover ──────────────────────────────────────────────────
-        story.extend(_cover_page(sections, st))
-
-        # ── 2. At-a-Glance ────────────────────────────────────────────
-        story.extend(_at_a_glance(sections, st))
-
-        # ── 3. Overview sections (from LLM markdown) ──────────────────
-        story.extend(_parse_markdown(summary, st))
-
-        # ── 4. Figures — inline after summary (only if images exist) ──
-        story.extend(_figures_section(sections.figures, st))
-
-        # ── 5. Equations reference ────────────────────────────────────
-        if sections.equations:
-            story.append(PageBreak())
-        story.extend(_equations_section(sections.equations, st))
-
-        # ── Disclaimer ────────────────────────────────────────────────
-        story.append(Spacer(1, 20))
-        story.append(HRFlowable(width="100%", thickness=0.5,
-                                color=C_RULE, spaceAfter=6))
+        story.append(Spacer(1, 24))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=C_RULE, spaceAfter=6))
         story.append(Paragraph(
-            "This overview was generated automatically by AI. "
-            "Always verify against the original publication.",
+            "AI-generated summary — always verify against the original publication.",
             st["footer"],
         ))
 
-        doc.build(story, onFirstPage=on_cover, onLaterPages=on_content)
+        doc.build(
+            story,
+            onFirstPage=lambda c, d: _on_cover(c, d, settings.report_author),
+            onLaterPages=lambda c, d: _on_page(c, d, short, settings.report_author),
+        )
 
     except Exception as exc:
-        raise ReportGenerationError(
-            "Failed to build PDF report.", original=exc
-        ) from exc
+        logger.error("PDF build failed: %s: %s", type(exc).__name__, exc, exc_info=True)
+        raise ReportGenerationError("Failed to build PDF.", original=exc) from exc
 
     result = buf.getvalue()
-    logger.info("PDF report built: %d bytes.", len(result))
+    logger.info("PDF built: %d bytes", len(result))
     return result
