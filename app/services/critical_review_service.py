@@ -141,18 +141,43 @@ def _contains_phrase(text: str, phrases: tuple[str, ...]) -> bool:
     return any(phrase in lower for phrase in phrases)
 
 
+def _is_raw_number_dump(text: str) -> bool:
+    """Detect items that are just a long raw list of numbers (e.g. GLUE score dumps)."""
+    # Count comma-separated numeric tokens
+    tokens = [t.strip() for t in text.split(",")]
+    numeric_tokens = [t for t in tokens if re.match(r'^\d[\d.±]*$', t)]
+    # If more than 4 out of the tokens are bare numbers → it's a dump
+    return len(tokens) > 4 and len(numeric_tokens) / len(tokens) > 0.5
+
+
 def _clean_evidence_items(evidence: list[str], limit: int = 5) -> list[str]:
     seen: set[str] = set()
     seen_numeric_fingerprints: set[str] = set()
     items: list[str] = []
     for item in evidence:
         cleaned = _clean_bullet(item)
+        # Strip pipe-formatted key_figure dumps (e.g. "Label: val | context | section")
+        # Keep only the meaningful first segment when pipes make it unwieldy
+        if "|" in cleaned:
+            segments = [s.strip() for s in cleaned.split("|")]
+            # Only keep if at least the first segment is meaningful and short enough
+            first = segments[0].strip()
+            if len(first) > 15:
+                cleaned = first
+            else:
+                cleaned = " — ".join(s for s in segments[:2] if s)
         lowered = cleaned.lower()
-        if not cleaned or lowered in seen or _contains_phrase(cleaned, GENERIC_PHRASES):
+        if not cleaned or len(cleaned) < 10 or lowered in seen or _contains_phrase(cleaned, GENERIC_PHRASES):
             continue
-        # Deduplicate key-figure style lines (containing "|", "Elo", or "latency")
-        # that share the same leading numeric value to avoid repeating the same metric.
-        if "|" in cleaned or "elo" in lowered or "latency" in lowered:
+        # Cap individual items at 180 chars — longer items are usually sentence dumps
+        if len(cleaned) > 180:
+            cleaned = cleaned[:177].rsplit(" ", 1)[0] + "…"
+            lowered = cleaned.lower()
+        # Filter out raw number-list dumps (e.g. "87.6, 94.8, 90.2, 63.6...")
+        if _is_raw_number_dump(cleaned):
+            continue
+        # Deduplicate key-figure style lines by leading numeric value
+        if "elo" in lowered or "latency" in lowered or "perplexity" in lowered:
             num_match = re.search(r'\b(\d[\d,.]*)\b', lowered)
             fingerprint = num_match.group(1) if num_match else ""
             if fingerprint and fingerprint in seen_numeric_fingerprints:
@@ -230,22 +255,24 @@ def _fallback_dimension_evidence(dimension: str, sections: PaperSections, limit:
     keywords = DIMENSION_KEYWORDS.get(dimension, ())
     candidates: list[str] = []
 
+    # Which key_figure sections are relevant for each review dimension
+    _KF_SECTION_SCOPE: dict[str, set[str]] = {
+        "strengths":              {"results", "abstract"},
+        "weaknesses":             {"limitations"},
+        "novelty":                {"abstract", "introduction"},
+        "assumptions":            {"methodology"},
+        "threats_to_validity":    {"limitations", "results"},
+        "reproducibility":        {"methodology", "results"},
+        "fairness_of_comparison": {"results"},
+        "applicability":          {"results", "conclusion"},
+    }
+
     for source in DIMENSION_EVIDENCE_SOURCES.get(dimension, ()):
         if source == "key_figures":
-            # Only include key_figures whose section or label matches this dimension
-            relevant_sections = {
-                "strengths":             {"results", "abstract"},
-                "weaknesses":            {"limitations"},
-                "novelty":               {"abstract", "introduction"},
-                "assumptions":           {"methodology"},
-                "threats_to_validity":   {"limitations", "results"},
-                "reproducibility":       {"methodology", "results"},
-                "fairness_of_comparison": {"results"},
-                "applicability":         {"results", "conclusion"},
-            }.get(dimension, set())
+            allowed_sections = _KF_SECTION_SCOPE.get(dimension, set())
             for figure in sections.key_figures[:15]:
-                fig_section = figure.section.lower().strip()
-                if relevant_sections and fig_section not in relevant_sections:
+                fig_sec = figure.section.lower().strip()
+                if allowed_sections and fig_sec not in allowed_sections:
                     continue
                 text = " | ".join(
                     part for part in (f"{figure.label}: {figure.value}", figure.context, figure.section) if part
@@ -290,13 +317,15 @@ def _sanitize_title(value: str) -> str:
     title = _safe_first_line(value, "title")
     if not title or title.lower() == NOT_FOUND.lower():
         return NOT_FOUND
-    # Accept any title between 8 and 300 chars (LoRA-style titles with subtitles can be long)
+    # Accept titles up to 300 chars (subtitles like "LoRA: Low-Rank Adaptation..." are valid)
     if len(title) < 8 or len(title) > 300:
         return NOT_FOUND
     if any(pattern.match(title) for pattern in TITLE_REJECTION_PATTERNS):
         return NOT_FOUND
-    # Only reject on truly non-title tokens; colons are fine (e.g. "LoRA: Low-Rank...")
+    # Only reject on URL/email patterns, not on the word "doi" alone
     if any(token in title.lower() for token in ("doi.org", "http://", "https://", "arxiv.org", "@")):
+        return NOT_FOUND
+    if any(token in title.lower() for token in ("abstract", "introduction")):
         return NOT_FOUND
     return title
 
@@ -368,25 +397,6 @@ def _normalize_assessment(
             )
         return _make_insufficient(dimension)
 
-    # ── CONSISTENCY CHECK: ensure verdict and rationale are not contradictory ──
-    # If the rationale says "does not provide" or "insufficient" but verdict is positive, reset rationale.
-    rationale_lower = _norm(assessment.rationale or "").lower()
-    verdict_lower   = _norm(assessment.verdict or "").lower()
-    _contradiction_positive_verdicts = (
-        "reasonably reproducible", "comparison setup appears reasonably supported",
-        "high computational efficiency", "effective", "appears stronger",
-    )
-    _contradiction_negative_phrases = (
-        "does not provide sufficient", "does not provide enough",
-        "not enough evidence", "insufficient", "lacks sufficient",
-        "no details", "not mentioned",
-    )
-    verdict_is_positive = any(p in verdict_lower for p in _contradiction_positive_verdicts)
-    rationale_is_negative = any(p in rationale_lower for p in _contradiction_negative_phrases)
-    if verdict_is_positive and rationale_is_negative:
-        # Rebuild rationale from evidence to eliminate the contradiction
-        assessment = assessment.model_copy(update={"rationale": _template_rationale(dimension, evidence)})
-
     if dimension == "novelty":
         novelty_text = _norm(" ".join([text, _source_text(sections)])).lower()
         found_types = [name for name, keywords in NOVELTY_TYPES.items() if any(keyword in novelty_text for keyword in keywords)]
@@ -427,14 +437,24 @@ def _normalize_assessment(
                 "Insufficient explicit evidence on hyperparameters, setup details, data splits, evaluation protocol, or release artifacts to judge reproducibility confidently.",
             )
         verdict = "Reasonably reproducible from the paper text" if len(found) >= 4 else "Only partial reproducibility evidence is available"
-        rationale = assessment.rationale if assessment.rationale and not _contains_phrase(assessment.rationale, GENERIC_PHRASES) else _template_rationale(dimension, evidence)
-        if len(found) < 4:
+        # Rebuild rationale from evidence to avoid contradiction with verdict
+        rationale = _template_rationale(dimension, evidence)
+        if verdict == "Only partial reproducibility evidence is available":
             rationale += " Important implementation details remain incomplete in the extracted text."
+        # Tighten confidence: no code release + fewer than 4 signals → cap at Medium
+        has_release = "release" in found
+        raw_confidence = "High" if len(found) >= 5 else ("Medium" if len(found) >= 3 else "Low")
+        if not has_release and raw_confidence == "High":
+            raw_confidence = "Medium"
+        # No hyperparams signal → cap at Low
+        has_hyperparams = "hyperparameters" in found
+        if not has_hyperparams and raw_confidence in ("High", "Medium") and len(found) < 4:
+            raw_confidence = "Low"
         return ReviewDimensionAssessment(
             verdict=verdict,
             rationale=rationale,
             evidence=evidence,
-            confidence="High" if len(found) >= 5 else ("Medium" if len(found) >= 3 else "Low"),
+            confidence=raw_confidence,
         )
 
     if dimension == "fairness_of_comparison":
@@ -448,18 +468,60 @@ def _normalize_assessment(
                 "Insufficient explicit evidence on matched datasets, metrics, baselines, or experimental controls to judge fairness confidently.",
             )
         verdict = "Comparison setup appears reasonably supported" if len(found) >= 4 and "controls" in found else "Only partial fairness evidence is available"
-        rationale = assessment.rationale if assessment.rationale and not _contains_phrase(assessment.rationale, GENERIC_PHRASES) else _template_rationale(dimension, evidence)
+        # Rebuild rationale from evidence to avoid contradiction with verdict
+        rationale = _template_rationale(dimension, evidence)
         if "controls" not in found:
-            rationale += " The extracted text does not make matched controls fully explicit."
+            rationale += " The extracted text does not make matched experimental controls fully explicit."
+        # Tighten confidence: no explicit controls → cap at Medium; also missing baselines → Low
+        has_controls = "controls" in found
+        has_baselines = "baselines" in found
+        raw_confidence = "High" if len(found) >= 5 and has_controls else ("Medium" if len(found) >= 3 else "Low")
+        if not has_controls and raw_confidence == "High":
+            raw_confidence = "Medium"
+        if not has_baselines and not has_controls and raw_confidence == "Medium":
+            raw_confidence = "Low"
         return ReviewDimensionAssessment(
             verdict=verdict,
             rationale=rationale,
             evidence=evidence,
-            confidence="High" if len(found) >= 5 and "controls" in found else ("Medium" if len(found) >= 3 else "Low"),
+            confidence=raw_confidence,
         )
 
+    if dimension == "applicability":
+        source = _source_text(sections)
+        deploy_signals = (
+            "deployment", "efficient", "latency", "memory", "compute", "practical",
+            "real-world", "scalable", "gpu", "parameter", "hardware", "inference",
+            "resource", "overhead", "cost", "throughput", "vram", "quantization",
+        )
+        deploy_hits = [sig for sig in deploy_signals if sig in source.lower() or sig in text.lower()]
+        if len(deploy_hits) >= 2:
+            # Enough deployment evidence — rebuild a supported verdict rather than "Not enough evidence"
+            if _norm(assessment.verdict).lower() in ("not enough evidence", NOT_ENOUGH_EVIDENCE.lower(), ""):
+                deploy_summary = ", ".join(deploy_hits[:4])
+                verdict = "Deployment and applicability evidence is present in the paper text"
+                rationale = (
+                    f"The paper contains explicit deployment-relevant signals ({deploy_summary}), "
+                    "which allow an applicability assessment grounded in the extracted text."
+                )
+                return ReviewDimensionAssessment(
+                    verdict=verdict,
+                    rationale=rationale,
+                    evidence=evidence,
+                    confidence="Medium" if specific >= 2 else "Low",
+                )
+
     if dimension in {"weaknesses", "threats_to_validity"}:
-        if not any(token in text.lower() for token in ("limitation", "limited", "lack", "missing", "not report", "only", "unclear", "bias", "omits")):
+        # Broaden search: LoRA-style papers often hide limitations in intro/methodology
+        implicit_weakness_tokens = (
+            "limitation", "limited", "lack", "missing", "not report", "only", "unclear",
+            "bias", "omits", "cannot", "does not", "may not", "however", "constraint",
+            "requires", "depend", "overhead", "trade-off", "tradeoff", "caveat",
+            "suboptimal", "challenging", "expensive", "restrictive",
+        )
+        # Check text (evidence + verdict + rationale) AND raw section text
+        extended_text = text.lower() + " " + sections.introduction.lower() + " " + sections.methodology.lower()
+        if not any(token in extended_text for token in implicit_weakness_tokens):
             return _make_insufficient(dimension)
 
     if dimension == "assumptions" and not any(token in text.lower() for token in ("assume", "requires", "depends on", "availability", "under")):
@@ -535,10 +597,18 @@ def _novelty_types(assessment: ReviewDimensionAssessment) -> set[str]:
 
 
 def _pairwise_evidence(a: ReviewDimensionAssessment, b: ReviewDimensionAssessment, raw: PairwiseDimensionComparison | None) -> list[str]:
+    # Always use labeled "Paper A:" / "Paper B:" prefixes — skip unlabeled raw evidence
+    # which is typically a duplicate of the per-paper evidence without the label prefix.
     evidence = [f"Paper A: {item}" for item in a.evidence[:2]]
     evidence.extend(f"Paper B: {item}" for item in b.evidence[:2])
     if raw:
-        evidence.extend(raw.evidence[:2])
+        # Only include raw evidence items that are NOT already covered by a or b evidence
+        a_texts = {_clean_bullet(item).lower() for item in a.evidence}
+        b_texts = {_clean_bullet(item).lower() for item in b.evidence}
+        for raw_item in raw.evidence[:2]:
+            cleaned = _clean_bullet(raw_item).lower()
+            if cleaned not in a_texts and cleaned not in b_texts:
+                evidence.append(raw_item)
     return _clean_evidence_items(evidence, limit=6)
 
 

@@ -163,13 +163,18 @@ Core rules:
 6. confidence must be exactly one of: "High", "Medium", "Low".
 7. Echo title and authors exactly as supplied. Do not rewrite or infer metadata.
 
-CRITICAL CONSISTENCY RULE:
-- The verdict and rationale MUST be consistent with each other.
-- If verdict is positive (e.g. "Reasonably reproducible"), the rationale MUST support it with positive evidence.
-- If verdict is negative or "Not enough evidence", the rationale MUST explain what is lacking.
-- NEVER write a positive verdict with a negative rationale like "does not provide sufficient details".
-- NEVER write a negative verdict with a positive rationale.
-- If you cannot write a consistent verdict+rationale pair, use verdict="Not enough evidence".
+CRITICAL CONSISTENCY RULE — violation of this rule invalidates the entire response:
+- The verdict and rationale for every dimension MUST be internally consistent.
+- POSITIVE verdict (e.g. "Reasonably reproducible", "Comparison setup appears supported") → rationale MUST explain WHY using specific positive evidence. The rationale must NOT say "does not provide", "insufficient", "lacks", "not mentioned", or any negative phrasing.
+- NEGATIVE verdict or "Not enough evidence" → rationale MUST explain WHAT is missing or WHY the evidence is insufficient.
+- If you cannot write a consistent pair, use verdict="Not enough evidence" with an honest rationale.
+- This rule applies especially to reproducibility and fairness_of_comparison.
+
+Evidence quality rules:
+- Do NOT include raw comma-separated number lists as evidence (e.g. "87.6, 94.8, 90.2, 63.6..."). These are useless.
+- Each evidence item must be a complete, meaningful sentence or phrase.
+- Do NOT repeat the same metric value across multiple evidence items.
+- Maximum 5 evidence items per dimension, all unique.
 
 Anti-hallucination rules:
 - No generic criticism templates.
@@ -178,17 +183,17 @@ Anti-hallucination rules:
 - No invented reproducibility claims.
 - No invented fairness claims.
 - No overall impact ranking unless the paper text makes that ranking explicit.
-- Ban vague phrases such as "may not be suitable for all tasks", "may not capture complex patterns", "high-quality methodology", "thorough analysis", or "fair evaluation metrics used" unless the prompt supplies concrete evidence that directly justifies them.
+- Ban vague phrases such as "may not be suitable for all tasks", "may not capture complex patterns", "high-quality methodology", "thorough analysis", or "fair evaluation metrics used".
 
 Dimension-specific rules:
 - strengths: only concrete positive qualities explicitly supported by the evidence inventory.
-- weaknesses: only explicit limitations, omissions, missing analyses, or strongly supported shortcomings. If the criticism is not tied to a concrete omission or stated limitation, use "Not enough evidence".
-- novelty: assess only from the paper's own positioning and contribution claims. Distinguish foundational novelty, incremental extension, engineering or practical innovation, and efficiency innovation. Do not rank overall field impact unless the evidence is explicit.
-- assumptions: only explicit or strongly implied assumptions the method depends on.
-- threats_to_validity: focus on evaluation scope, dataset bias, benchmark coverage, confounders, missing ablations, or stated limitations.
-- reproducibility: require evidence about hyperparameters, setup clarity, architecture detail, datasets or splits, evaluation protocol, implementation details, or code/checkpoint release mentions. Tables and figures alone are not enough. A positive verdict requires at least 3 of these signals present.
-- fairness_of_comparison: require evidence of baselines, matched tasks or datasets, matched metrics, experimental controls, or fairness caveats. Simply having baselines is not enough.
-- applicability: judge practical usability from compute burden, deployment realism, transferability, task scope, or operational constraints.
+- weaknesses: only explicit limitations, omissions, missing analyses, or strongly supported shortcomings. Must cite a specific gap or stated limitation.
+- novelty: assess only from the paper's own positioning and contribution claims. Distinguish foundational novelty, incremental extension, engineering or practical innovation, and efficiency innovation.
+- assumptions: only explicit or strongly implied assumptions the method depends on (e.g. "assumes low intrinsic rank", "requires pretrained model").
+- threats_to_validity: focus on evaluation scope, dataset bias, benchmark coverage, confounders, missing ablations, or stated limitations. NOT memory footprints or training details.
+- reproducibility: a POSITIVE verdict requires at least 3 of these signals: hyperparameters, architecture detail, dataset/splits, evaluation protocol, code/checkpoint release. State which signals are PRESENT and which are ABSENT.
+- fairness_of_comparison: require named baselines + matched metrics. Simply having results is not enough.
+- applicability: judge from compute burden, deployment realism, transferability, or task scope constraints.
 """
 
 
@@ -212,15 +217,20 @@ Return one JSON object with EXACTLY these top-level keys:
 
 Each dimension object must contain EXACTLY:
 - "verdict": short judgement string
-- "rationale": 2-4 evidence-grounded sentences that MUST be consistent with the verdict
-- "evidence": list of short, specific bullet-like strings (max 5, NO duplicates, NO same metric repeated)
+- "rationale": 2-4 evidence-grounded sentences consistent with the verdict
+- "evidence": list of 1-5 short, specific, UNIQUE bullet-like strings
 - "confidence": "High", "Medium", or "Low"
 
-MANDATORY CONSISTENCY:
-- If verdict is positive → rationale must explain WHY it is positive using evidence
-- If verdict is negative or "Not enough evidence" → rationale must explain WHAT is missing
-- NEVER combine a positive verdict with rationale that says "does not provide" or "insufficient"
-- NEVER list the same metric (e.g. same Elo score value) more than once in evidence
+MANDATORY CONSISTENCY — check before writing each dimension:
+- Positive verdict → rationale must explain the positive evidence (no "does not provide", "insufficient", "lacks")
+- Negative verdict / "Not enough evidence" → rationale must explain what is missing
+- Violation = invalid response
+
+EVIDENCE QUALITY RULES:
+- NO raw number lists like "87.6, 94.8, 90.2..." — these are invalid evidence items
+- Each item must be a complete, meaningful phrase (not a bare number sequence)
+- NO duplicate values — if a metric appears once, never repeat it
+- For reproducibility: explicitly state which signals are PRESENT (hyperparams, splits, code) and which are ABSENT
 
 If evidence is missing or indirect, use:
 - verdict: "Not enough evidence"
@@ -242,12 +252,19 @@ Introduction:
 Evidence Inventory:
 {_build_evidence_inventory(sections)}
 
-Evidence formatting requirements:
-- Each evidence item must be UNIQUE — do not repeat the same number or metric.
-- Prefer evidence like "Evaluates on WikiSQL and Spider", "Reports 4-bit quantization and reduced memory use", "Does not report train/validation/test split details", "Compares against GPTQ and LoRA baselines", "Reports +2.3 BLEU over baseline X".
-- Avoid evidence like "high quality methodology", "thorough analysis", or "fair evaluation metrics used".
-- For reproducibility: list what IS reported (hyperparams, split, code) and what is NOT.
-- For fairness: name the specific baselines compared against, or state they are absent.
+Good evidence examples:
+- "Evaluates on MMLU benchmark across 63 subjects"
+- "Compares against GPTQ and LoRA baselines with matched metrics"
+- "Does not report train/validation/test split details"
+- "Reports 4-bit NF4 quantization reducing memory to 48GB for 65B model"
+- "No code or checkpoint release mentioned in the text"
+- "Batch size of 1, learning rate not reported"
+
+Bad evidence examples (DO NOT USE):
+- "87.6, 94.8, 90.2, 63.6, 92.8..." (raw number dump)
+- "high quality methodology"
+- "thorough analysis"
+- Repeating the same metric twice
 """
 
 
@@ -269,10 +286,17 @@ Compare ONLY these dimensions:
 Rules:
 1. Return valid JSON only. No markdown, no code fences, no explanation.
 2. Use only the two structured paper profiles supplied in the prompt. Never invent facts.
-3. Be conservative. If the profiles do not justify a confident ordering, say "Insufficient evidence to rank overall".
+3. Be conservative. If the profiles do not justify a confident ordering, say "Insufficient evidence to rank overall from the paper text alone".
 4. Avoid winner/loser language unless the evidence is concrete.
-5. Novelty must be nuanced. Distinguish foundational contribution, extension, efficiency innovation, and practical or engineering innovation. Do not collapse novelty into a single impact ranking unless clearly justified.
+5. Novelty must be nuanced. Distinguish foundational contribution, extension, efficiency innovation, and practical or engineering innovation.
 6. Produce exactly eight comparison objects in the required order.
+
+Evidence quality rules for pairwise:
+- The "evidence" list must contain ONLY items prefixed with "Paper A:" or "Paper B:".
+- Do NOT include unlabeled evidence items — every item must say which paper it refers to.
+- Do NOT repeat the same item from a per-paper profile as both labeled and unlabeled.
+- No raw number lists. Each evidence item must be a complete, meaningful phrase.
+- Maximum 4 evidence items per comparison object.
 """
 
 
