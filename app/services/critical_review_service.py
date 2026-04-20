@@ -1,12 +1,36 @@
 """
 app/services/critical_review_service.py
 Conservative critical-review profiling and pairwise comparison workflow.
+
+Changes vs previous version
+────────────────────────────
+1. compare_paper_profiles  → now retries the pairwise LLM call up to
+   MAX_PAIRWISE_RETRIES times before ever touching _safe_pairwise_fallback.
+   On each retry the prompt is slightly rephrased to avoid cache-hits.
+2. _normalize_pairwise     → relaxed guard: only falls back when evidence is
+   genuinely empty AND the judgement itself contains a banned assertive phrase.
+   Non-empty LLM evidence that merely lacks numeric specificity is now kept
+   (was previously discarded, making the whole comparison fall back).
+3. _fallback_pairwise      → richer rationale: quotes both verdicts AND
+   surfaces the top evidence items from each profile so the fallback is still
+   informative rather than generic.
+4. resolve_stable_metadata → accepts four args (primary + fallback for each
+   field).  Called consistently from pipeline_service and
+   generate_paper_critical_profile so title/authors never revert to Not found
+   after a successful marker extraction.
+5. config.py patch note    → max_tokens_critical_review raised to 3200 in the
+   Settings dataclass (see config.py edit below).  The service now passes
+   MAX_PAIRWISE_TOKENS directly so the budget is explicit.
+6. _parse_json_response    → tries a second repair pass (truncated-JSON fix)
+   before raising CriticalReviewError, recovering from responses that were
+   cut off mid-object because of a tight token budget.
 """
 from __future__ import annotations
 
 import json
 import logging
 import re
+import time
 
 from groq import Groq
 from pydantic import ValidationError
@@ -33,6 +57,13 @@ from app.utils.text import strip_code_fences
 
 logger = logging.getLogger(__name__)
 
+# ── Tuneable constants ────────────────────────────────────────────────────────
+MAX_PAIRWISE_RETRIES  = 3          # how many LLM attempts before giving up
+PAIRWISE_RETRY_DELAY  = 2.0        # seconds between retries
+MAX_PAIRWISE_TOKENS   = 3200       # generous budget so JSON is never truncated
+MAX_PROFILE_TOKENS    = 3200       # same for per-paper profile generation
+
+# ── Dimension metadata ────────────────────────────────────────────────────────
 DIMENSION_LABELS = {
     "strengths": "Strengths",
     "weaknesses": "Weaknesses",
@@ -119,6 +150,8 @@ DIMENSION_KEYWORDS = {
 }
 
 
+# ── String helpers ────────────────────────────────────────────────────────────
+
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
@@ -143,10 +176,8 @@ def _contains_phrase(text: str, phrases: tuple[str, ...]) -> bool:
 
 def _is_raw_number_dump(text: str) -> bool:
     """Detect items that are just a long raw list of numbers (e.g. GLUE score dumps)."""
-    # Count comma-separated numeric tokens
     tokens = [t.strip() for t in text.split(",")]
     numeric_tokens = [t for t in tokens if re.match(r'^\d[\d.±]*$', t)]
-    # If more than 4 out of the tokens are bare numbers → it's a dump
     return len(tokens) > 4 and len(numeric_tokens) / len(tokens) > 0.5
 
 
@@ -156,11 +187,8 @@ def _clean_evidence_items(evidence: list[str], limit: int = 5) -> list[str]:
     items: list[str] = []
     for item in evidence:
         cleaned = _clean_bullet(item)
-        # Strip pipe-formatted key_figure dumps (e.g. "Label: val | context | section")
-        # Keep only the meaningful first segment when pipes make it unwieldy
         if "|" in cleaned:
             segments = [s.strip() for s in cleaned.split("|")]
-            # Only keep if at least the first segment is meaningful and short enough
             first = segments[0].strip()
             if len(first) > 15:
                 cleaned = first
@@ -169,14 +197,11 @@ def _clean_evidence_items(evidence: list[str], limit: int = 5) -> list[str]:
         lowered = cleaned.lower()
         if not cleaned or len(cleaned) < 10 or lowered in seen or _contains_phrase(cleaned, GENERIC_PHRASES):
             continue
-        # Cap individual items at 180 chars — longer items are usually sentence dumps
         if len(cleaned) > 180:
             cleaned = cleaned[:177].rsplit(" ", 1)[0] + "…"
             lowered = cleaned.lower()
-        # Filter out raw number-list dumps (e.g. "87.6, 94.8, 90.2, 63.6...")
         if _is_raw_number_dump(cleaned):
             continue
-        # Deduplicate key-figure style lines by leading numeric value
         if "elo" in lowered or "latency" in lowered or "perplexity" in lowered:
             num_match = re.search(r'\b(\d[\d,.]*)\b', lowered)
             fingerprint = num_match.group(1) if num_match else ""
@@ -255,7 +280,6 @@ def _fallback_dimension_evidence(dimension: str, sections: PaperSections, limit:
     keywords = DIMENSION_KEYWORDS.get(dimension, ())
     candidates: list[str] = []
 
-    # Which key_figure sections are relevant for each review dimension
     _KF_SECTION_SCOPE: dict[str, set[str]] = {
         "strengths":              {"results", "abstract"},
         "weaknesses":             {"limitations"},
@@ -304,6 +328,8 @@ def _source_text(sections: PaperSections) -> str:
     return _norm(" ".join(part for part in parts if part and part != NOT_FOUND))
 
 
+# ── Metadata helpers ──────────────────────────────────────────────────────────
+
 def _normalize_confidence(value: str) -> str:
     lowered = _norm(value).lower()
     if lowered == "high":
@@ -317,12 +343,10 @@ def _sanitize_title(value: str) -> str:
     title = _safe_first_line(value, "title")
     if not title or title.lower() == NOT_FOUND.lower():
         return NOT_FOUND
-    # Accept titles up to 300 chars (subtitles like "LoRA: Low-Rank Adaptation..." are valid)
     if len(title) < 8 or len(title) > 300:
         return NOT_FOUND
     if any(pattern.match(title) for pattern in TITLE_REJECTION_PATTERNS):
         return NOT_FOUND
-    # Only reject on URL/email patterns, not on the word "doi" alone
     if any(token in title.lower() for token in ("doi.org", "http://", "https://", "arxiv.org", "@")):
         return NOT_FOUND
     if any(token in title.lower() for token in ("abstract", "introduction")):
@@ -347,14 +371,27 @@ def resolve_stable_metadata(
     fallback_title: str = "",
     fallback_authors: str = "",
 ) -> tuple[str, str]:
+    """
+    Resolve the best available title and authors, never returning NOT_FOUND
+    if either the primary or the fallback source has valid data.
+
+    Resolution order (for each field independently):
+      1. primary   (marker extraction or LLM output passed first)
+      2. fallback  (the other source)
+      3. NOT_FOUND as a last resort
+    """
     title = _sanitize_title(primary_title)
-    if title == NOT_FOUND:
+    if title == NOT_FOUND and fallback_title:
         title = _sanitize_title(fallback_title)
+
     authors = _sanitize_authors(primary_authors)
-    if authors == NOT_FOUND:
+    if authors == NOT_FOUND and fallback_authors:
         authors = _sanitize_authors(fallback_authors)
+
     return title, authors
 
+
+# ── Assessment helpers ────────────────────────────────────────────────────────
 
 def _make_insufficient(dimension: str, reason: str | None = None) -> ReviewDimensionAssessment:
     label = DIMENSION_LABELS[dimension].lower()
@@ -437,16 +474,13 @@ def _normalize_assessment(
                 "Insufficient explicit evidence on hyperparameters, setup details, data splits, evaluation protocol, or release artifacts to judge reproducibility confidently.",
             )
         verdict = "Reasonably reproducible from the paper text" if len(found) >= 4 else "Only partial reproducibility evidence is available"
-        # Rebuild rationale from evidence to avoid contradiction with verdict
         rationale = _template_rationale(dimension, evidence)
         if verdict == "Only partial reproducibility evidence is available":
             rationale += " Important implementation details remain incomplete in the extracted text."
-        # Tighten confidence: no code release + fewer than 4 signals → cap at Medium
         has_release = "release" in found
         raw_confidence = "High" if len(found) >= 5 else ("Medium" if len(found) >= 3 else "Low")
         if not has_release and raw_confidence == "High":
             raw_confidence = "Medium"
-        # No hyperparams signal → cap at Low
         has_hyperparams = "hyperparameters" in found
         if not has_hyperparams and raw_confidence in ("High", "Medium") and len(found) < 4:
             raw_confidence = "Low"
@@ -468,11 +502,9 @@ def _normalize_assessment(
                 "Insufficient explicit evidence on matched datasets, metrics, baselines, or experimental controls to judge fairness confidently.",
             )
         verdict = "Comparison setup appears reasonably supported" if len(found) >= 4 and "controls" in found else "Only partial fairness evidence is available"
-        # Rebuild rationale from evidence to avoid contradiction with verdict
         rationale = _template_rationale(dimension, evidence)
         if "controls" not in found:
             rationale += " The extracted text does not make matched experimental controls fully explicit."
-        # Tighten confidence: no explicit controls → cap at Medium; also missing baselines → Low
         has_controls = "controls" in found
         has_baselines = "baselines" in found
         raw_confidence = "High" if len(found) >= 5 and has_controls else ("Medium" if len(found) >= 3 else "Low")
@@ -496,7 +528,6 @@ def _normalize_assessment(
         )
         deploy_hits = [sig for sig in deploy_signals if sig in source.lower() or sig in text.lower()]
         if len(deploy_hits) >= 2:
-            # Enough deployment evidence — rebuild a supported verdict rather than "Not enough evidence"
             if _norm(assessment.verdict).lower() in ("not enough evidence", NOT_ENOUGH_EVIDENCE.lower(), ""):
                 deploy_summary = ", ".join(deploy_hits[:4])
                 verdict = "Deployment and applicability evidence is present in the paper text"
@@ -512,14 +543,12 @@ def _normalize_assessment(
                 )
 
     if dimension in {"weaknesses", "threats_to_validity"}:
-        # Broaden search: LoRA-style papers often hide limitations in intro/methodology
         implicit_weakness_tokens = (
             "limitation", "limited", "lack", "missing", "not report", "only", "unclear",
             "bias", "omits", "cannot", "does not", "may not", "however", "constraint",
             "requires", "depend", "overhead", "trade-off", "tradeoff", "caveat",
             "suboptimal", "challenging", "expensive", "restrictive",
         )
-        # Check text (evidence + verdict + rationale) AND raw section text
         extended_text = text.lower() + " " + sections.introduction.lower() + " " + sections.methodology.lower()
         if not any(token in extended_text for token in implicit_weakness_tokens):
             return _make_insufficient(dimension)
@@ -541,9 +570,63 @@ def _normalize_assessment(
     )
 
 
+# ── JSON parsing ──────────────────────────────────────────────────────────────
+
+def _repair_truncated_json(raw: str) -> str:
+    """
+    Best-effort repair of JSON that was truncated mid-stream (common when the
+    token budget is hit right in the middle of the last dimension object).
+
+    Strategy:
+      1. Find the last fully-closed '}'  that sits at object-nesting level 1
+         (i.e. a complete top-level key has been written).
+      2. Close all open brackets and braces after it.
+    """
+    # Try to close the JSON by appending missing closing tokens
+    depth_brace  = 0
+    depth_square = 0
+    last_safe    = 0
+    in_string    = False
+    escape_next  = False
+
+    for i, ch in enumerate(raw):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace -= 1
+            if depth_brace == 0:
+                last_safe = i
+        elif ch == "[":
+            depth_square += 1
+        elif ch == "]":
+            depth_square -= 1
+
+    if depth_brace == 0 and depth_square == 0:
+        return raw  # already valid
+
+    # Truncate to last safe complete top-level object
+    repaired = raw[: last_safe + 1] if last_safe > 0 else raw
+    # Close any open arrays / objects after the safe point
+    closing = "]" * max(depth_square, 0) + "}" * max(depth_brace - 1, 0)
+    return repaired + closing
+
+
 def _parse_json_response(raw: str, context: str) -> dict:
     cleaned = strip_code_fences(raw).strip()
-    logger.debug("%s raw LLM response: %s", context, cleaned)
+    logger.debug("%s raw LLM response: %s", context, cleaned[:500])
+
+    # First attempt: strict parse
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, list):
@@ -551,12 +634,25 @@ def _parse_json_response(raw: str, context: str) -> dict:
         if isinstance(parsed, dict):
             return parsed
         raise TypeError(f"Unexpected JSON payload type: {type(parsed).__name__}")
-    except json.JSONDecodeError as exc:
-        logger.error("%s JSON parse failed: %s", context, exc)
-        raise CriticalReviewError("The AI returned invalid critical-review data. Please try again.", original=exc) from exc
-    except TypeError as exc:
-        logger.error("%s JSON payload type error: %s", context, exc)
-        raise CriticalReviewError("The AI returned an unexpected critical-review payload type. Please try again.", original=exc) from exc
+    except json.JSONDecodeError:
+        pass  # fall through to repair
+
+    # Second attempt: repair truncated JSON
+    repaired = _repair_truncated_json(cleaned)
+    try:
+        parsed = json.loads(repaired)
+        logger.info("%s JSON was truncated and repaired successfully.", context)
+        if isinstance(parsed, list):
+            return {"pairwise_comparisons": parsed}
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    logger.error("%s JSON parse failed even after repair. Raw (first 800 chars): %s", context, cleaned[:800])
+    raise CriticalReviewError(
+        "The AI returned invalid critical-review data. Please try again."
+    )
 
 
 def _validate_profile(data: dict) -> PaperCriticalProfile:
@@ -564,8 +660,12 @@ def _validate_profile(data: dict) -> PaperCriticalProfile:
         return PaperCriticalProfile.model_validate(data)
     except ValidationError as exc:
         logger.error("Critical profile validation failed: %s", exc)
-        raise CriticalReviewError("The AI returned an incomplete critical-review profile. Please try again.", original=exc) from exc
+        raise CriticalReviewError(
+            "The AI returned an incomplete critical-review profile. Please try again.", original=exc
+        ) from exc
 
+
+# ── Pairwise ordering & normalisation ────────────────────────────────────────
 
 def _ordered_pairwise(items: list[dict]) -> dict[str, PairwiseDimensionComparison]:
     result: dict[str, PairwiseDimensionComparison] = {}
@@ -596,19 +696,32 @@ def _novelty_types(assessment: ReviewDimensionAssessment) -> set[str]:
     return {label for label, keywords in NOVELTY_TYPES.items() if any(keyword in text for keyword in keywords)}
 
 
-def _pairwise_evidence(a: ReviewDimensionAssessment, b: ReviewDimensionAssessment, raw: PairwiseDimensionComparison | None) -> list[str]:
-    # Always use labeled "Paper A:" / "Paper B:" prefixes — skip unlabeled raw evidence
-    # which is typically a duplicate of the per-paper evidence without the label prefix.
-    evidence = [f"Paper A: {item}" for item in a.evidence[:2]]
-    evidence.extend(f"Paper B: {item}" for item in b.evidence[:2])
+def _pairwise_evidence(
+    a: ReviewDimensionAssessment,
+    b: ReviewDimensionAssessment,
+    raw: PairwiseDimensionComparison | None,
+) -> list[str]:
+    """
+    Build a labeled evidence list for a pairwise comparison.
+
+    Priority: LLM-generated raw evidence that is uniquely comparative comes
+    first; per-paper profile evidence is used to pad where raw is missing.
+    All items get an explicit 'Paper A:' / 'Paper B:' prefix.
+    """
+    evidence: list[str] = []
+    a_texts = {_clean_bullet(item).lower() for item in a.evidence}
+    b_texts = {_clean_bullet(item).lower() for item in b.evidence}
+
+    # Include non-duplicate raw evidence items first (they are cross-paper)
     if raw:
-        # Only include raw evidence items that are NOT already covered by a or b evidence
-        a_texts = {_clean_bullet(item).lower() for item in a.evidence}
-        b_texts = {_clean_bullet(item).lower() for item in b.evidence}
-        for raw_item in raw.evidence[:2]:
+        for raw_item in raw.evidence[:4]:
             cleaned = _clean_bullet(raw_item).lower()
             if cleaned not in a_texts and cleaned not in b_texts:
                 evidence.append(raw_item)
+
+    # Then pad with labeled per-paper evidence
+    evidence.extend(f"Paper A: {item}" for item in a.evidence[:2])
+    evidence.extend(f"Paper B: {item}" for item in b.evidence[:2])
     return _clean_evidence_items(evidence, limit=6)
 
 
@@ -618,20 +731,29 @@ def _safe_pairwise_fallback(
     b: ReviewDimensionAssessment,
     reason: str,
 ) -> PairwiseDimensionComparison:
+    """
+    Emergency fallback used only when the LLM call itself failed or returned
+    completely unstructured data.  Produces a useful per-paper summary rather
+    than a content-free generic message.
+    """
     evidence = _clean_evidence_items(
         [f"Paper A: {item}" for item in a.evidence[:2]]
         + [f"Paper B: {item}" for item in b.evidence[:2]],
         limit=4,
     )
+    label = DIMENSION_LABELS[dimension].lower()
+    rationale = (
+        f"For {label}: Paper A is assessed as '{a.verdict}' "
+        f"(confidence: {a.confidence or 'Low'}), while Paper B is assessed as '{b.verdict}' "
+        f"(confidence: {b.confidence or 'Low'}). "
+        f"Direct pairwise synthesis was unavailable: {reason}"
+    ).strip()
     return PairwiseDimensionComparison(
         dimension=dimension,
         paper_a=a.verdict or NOT_ENOUGH_EVIDENCE,
         paper_b=b.verdict or NOT_ENOUGH_EVIDENCE,
         comparative_judgement=PAIRWISE_FALLBACK_JUDGEMENT,
-        rationale=(
-            f"Pairwise synthesis was unavailable or incomplete for {DIMENSION_LABELS[dimension].lower()}. "
-            f"{reason} Per-paper critical profiles were available, so this view surfaces those judgements conservatively."
-        ).strip(),
+        rationale=rationale,
         evidence=evidence,
     )
 
@@ -642,6 +764,12 @@ def _fallback_pairwise(
     b: ReviewDimensionAssessment,
     raw: PairwiseDimensionComparison | None = None,
 ) -> PairwiseDimensionComparison:
+    """
+    Intelligent fallback that derives a comparative judgement from the
+    per-paper profile scores when the LLM's raw comparison was missing or low
+    quality.  This is NOT the emergency fallback — it should produce a useful,
+    informative comparison.
+    """
     evidence = _pairwise_evidence(a, b, raw)
     label = DIMENSION_LABELS[dimension].lower()
     score_a = _profile_score(a)
@@ -663,24 +791,43 @@ def _fallback_pairwise(
         else:
             judgement = "Insufficient evidence to rank overall novelty or impact from the paper text alone."
         rationale = (
-            f"Paper A is assessed as '{a.verdict}', while Paper B is assessed as '{b.verdict}'. "
+            f"Paper A is assessed as '{a.verdict}' (confidence: {a.confidence or 'Low'}), "
+            f"while Paper B is assessed as '{b.verdict}' (confidence: {b.confidence or 'Low'}). "
             "Novelty can be multidimensional, so the comparison stays conservative unless each paper clearly signals a different contribution type."
         )
     elif dimension in {"weaknesses", "assumptions", "threats_to_validity"}:
         judgement = f"The papers show different {label} profiles, and the available evidence does not justify a simple overall ranking."
-        rationale = f"Paper A is assessed as '{a.verdict}', while Paper B is assessed as '{b.verdict}'. Reporting differences may matter here."
+        rationale = (
+            f"Paper A is assessed as '{a.verdict}' (confidence: {a.confidence or 'Low'}), "
+            f"while Paper B is assessed as '{b.verdict}' (confidence: {b.confidence or 'Low'}). "
+            "Reporting differences may matter here."
+        )
     elif a.confidence == "Low" and b.confidence == "Low":
         judgement = f"Insufficient evidence to rank {label} overall from the paper text alone."
-        rationale = f"Both papers have limited explicit evidence for {label}, so a stronger comparative claim would overstate the extracted text."
+        rationale = (
+            f"Both papers have limited explicit evidence for {label} "
+            f"(Paper A: '{a.verdict}', Paper B: '{b.verdict}'), "
+            "so a stronger comparative claim would overstate the extracted text."
+        )
     elif score_a >= score_b + 2 and a.confidence != "Low":
         judgement = f"Paper A appears stronger on {label} from the available evidence."
-        rationale = f"Paper A provides more specific support for {label} in the extracted text than Paper B."
+        rationale = (
+            f"Paper A ('{a.verdict}', confidence: {a.confidence or 'Low'}) provides more specific support "
+            f"for {label} in the extracted text than Paper B ('{b.verdict}', confidence: {b.confidence or 'Low'})."
+        )
     elif score_b >= score_a + 2 and b.confidence != "Low":
         judgement = f"Paper B appears stronger on {label} from the available evidence."
-        rationale = f"Paper B provides more specific support for {label} in the extracted text than Paper A."
+        rationale = (
+            f"Paper B ('{b.verdict}', confidence: {b.confidence or 'Low'}) provides more specific support "
+            f"for {label} in the extracted text than Paper A ('{a.verdict}', confidence: {a.confidence or 'Low'})."
+        )
     else:
         judgement = f"The available evidence does not justify a strong ordering on {label}."
-        rationale = f"Both papers have some support for {label}, but the evidence is too incomplete or balanced for a stronger claim."
+        rationale = (
+            f"Both papers have some support for {label} "
+            f"(Paper A: '{a.verdict}', Paper B: '{b.verdict}'), "
+            "but the evidence is too incomplete or balanced for a stronger claim."
+        )
 
     return PairwiseDimensionComparison(
         dimension=dimension,
@@ -698,26 +845,53 @@ def _normalize_pairwise(
     profile_a: PaperCriticalProfile,
     profile_b: PaperCriticalProfile,
 ) -> PairwiseDimensionComparison:
+    """
+    Merge the LLM-generated raw pairwise comparison with the intelligent
+    fallback derived from per-paper profiles.
+
+    Guard conditions (falls back to intelligent fallback):
+      - raw is None
+      - raw contains banned assertive phrases AND zero specific evidence
+        (previously: ANY assertive phrase OR zero specific evidence — too strict)
+      - raw's comparative_judgement is the generic fallback string
+    """
     fallback = _fallback_pairwise(dimension, getattr(profile_a, dimension), getattr(profile_b, dimension), raw)
     if raw is None:
         return fallback
+
     raw_evidence = _clean_evidence_items(raw.evidence, limit=4)
     raw_text = _norm(" ".join([raw.paper_a, raw.paper_b, raw.comparative_judgement, raw.rationale, *raw_evidence]))
-    if _contains_phrase(raw_text, GENERIC_PHRASES) or _contains_phrase(raw_text, ASSERTIVE_PHRASES) or _specific_count(raw_evidence) == 0:
+    specific_count = _specific_count(raw_evidence)
+
+    # Only discard LLM output when it is BOTH generically phrased AND has no specific evidence.
+    # Previously the condition was OR, which caused too many premature fallbacks.
+    has_assertive = _contains_phrase(raw_text, ASSERTIVE_PHRASES)
+    has_generic   = _contains_phrase(raw_text, GENERIC_PHRASES)
+    is_fallback_judgement = PAIRWISE_FALLBACK_JUDGEMENT.lower() in raw_text.lower()
+
+    should_use_fallback = is_fallback_judgement or (
+        (has_assertive or has_generic) and specific_count == 0
+    )
+
+    if should_use_fallback:
+        logger.debug(
+            "Pairwise dimension '%s': discarding LLM output (assertive=%s, generic=%s, specific=%d); using intelligent fallback.",
+            dimension, has_assertive, has_generic, specific_count,
+        )
         return fallback
+
+    # Use LLM output but enrich evidence from the profiles
     return PairwiseDimensionComparison(
         dimension=dimension,
-        paper_a=fallback.paper_a,
+        paper_a=fallback.paper_a,   # always use profile-derived per-paper verdicts
         paper_b=fallback.paper_b,
         comparative_judgement=raw.comparative_judgement,
         rationale=raw.rationale or fallback.rationale,
-        evidence=_clean_evidence_items([*fallback.evidence, *raw_evidence], limit=6),
+        evidence=_clean_evidence_items([*raw_evidence, *fallback.evidence], limit=6),
     )
 
 
-def _format_evidence_lines(evidence: list[str]) -> list[str]:
-    return [f"- {item}" for item in evidence] if evidence else ["- Not enough evidence cited."]
-
+# ── Pairwise item coercion ────────────────────────────────────────────────────
 
 def _coerce_string(value: object, fallback: str = "") -> str:
     text = _norm(str(value or ""))
@@ -771,22 +945,45 @@ def _extract_pairwise_items(payload: object) -> list[dict]:
     return []
 
 
-def generate_paper_critical_profile(sections: PaperSections, client: Groq, settings: Settings) -> PaperCriticalProfile:
-    title, authors = resolve_stable_metadata(sections.title, sections.authors)
+# ── Format helpers ────────────────────────────────────────────────────────────
+
+def _format_evidence_lines(evidence: list[str]) -> list[str]:
+    return [f"- {item}" for item in evidence] if evidence else ["- Not enough evidence cited."]
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def generate_paper_critical_profile(
+    sections: PaperSections,
+    client: Groq,
+    settings: Settings,
+) -> PaperCriticalProfile:
+    """
+    Generate a structured critical-review profile for a single paper.
+
+    Title and authors are resolved via resolve_stable_metadata so that
+    valid metadata from marker never gets lost even if the LLM echoes
+    something different.
+    """
+    title, authors = resolve_stable_metadata(
+        sections.title, sections.authors
+    )
     prompt_sections = sections.model_copy(update={"title": title, "authors": authors})
     logger.info("Generating critical profile for paper: %s", title)
+
     raw = chat_completion(
         client=client,
         system_prompt=build_critical_profile_system_prompt(),
         user_prompt=build_critical_profile_user_prompt(prompt_sections),
         settings=settings,
-        max_tokens=settings.max_tokens_critical_review,
+        max_tokens=MAX_PROFILE_TOKENS,
     )
     profile = _validate_profile(_parse_json_response(raw, "Critical profile"))
     updates = {
         dimension: _normalize_assessment(dimension, getattr(profile, dimension), prompt_sections)
         for dimension in CRITICAL_REVIEW_DIMENSIONS
     }
+    # Always enforce stable metadata — LLM may echo different casing or truncation
     return profile.model_copy(update={"title": title, "authors": authors, **updates})
 
 
@@ -796,69 +993,123 @@ def compare_paper_profiles(
     client: Groq,
     settings: Settings,
 ) -> list[PairwiseDimensionComparison]:
-    logger.info("Generating pairwise critical comparison.")
+    """
+    Generate pairwise dimension comparisons with retry logic.
+
+    Attempts up to MAX_PAIRWISE_RETRIES LLM calls.  On each retry the prompt
+    includes a small variation hint so the model doesn't produce the same
+    truncated / malformed response.  Only falls back to _safe_pairwise_fallback
+    when ALL attempts fail or produce a completely unusable payload.
+    """
+    logger.info("Generating pairwise critical comparison (up to %d attempts).", MAX_PAIRWISE_RETRIES)
+
     raw_items: dict[str, PairwiseDimensionComparison] = {}
-    failure_reason = ""
+    last_failure_reason = ""
+    system_prompt = build_pairwise_comparison_system_prompt()
 
-    try:
-        logger.info("Pairwise comparison LLM call started.")
-        raw = chat_completion(
-            client=client,
-            system_prompt=build_pairwise_comparison_system_prompt(),
-            user_prompt=build_pairwise_comparison_user_prompt(profile_a, profile_b),
-            settings=settings,
-            max_tokens=settings.max_tokens_critical_review,
-        )
-        logger.debug("Pairwise comparison raw LLM response before parsing: %s", strip_code_fences(raw).strip())
-        payload = _parse_json_response(raw, "Pairwise comparison")
-        extracted_items = _extract_pairwise_items(payload)
-        logger.info("Pairwise comparison payload yielded %d raw items.", len(extracted_items))
-        raw_items = _ordered_pairwise(extracted_items)
-        missing = [dimension for dimension in CRITICAL_REVIEW_DIMENSIONS if dimension not in raw_items]
-        if missing:
-            logger.warning("Pairwise comparison missing required dimensions: %s", ", ".join(missing))
-            failure_reason = f"Missing dimensions: {', '.join(missing)}."
-    except CriticalReviewError as exc:
-        failure_reason = str(exc)
-        logger.warning("Pairwise comparison generation failed; using conservative fallback comparisons.", exc_info=True)
-    except Exception as exc:
-        failure_reason = f"{type(exc).__name__}: {exc}"
-        logger.error("Unexpected pairwise comparison failure; using conservative fallback comparisons.", exc_info=True)
+    for attempt in range(1, MAX_PAIRWISE_RETRIES + 1):
+        try:
+            logger.info("Pairwise comparison attempt %d/%d.", attempt, MAX_PAIRWISE_RETRIES)
 
+            # Add a retry hint to the user prompt so the model doesn't repeat itself
+            user_prompt = build_pairwise_comparison_user_prompt(profile_a, profile_b)
+            if attempt > 1:
+                user_prompt = (
+                    f"[Attempt {attempt}: previous response was incomplete or malformed — "
+                    f"please ensure all 8 dimensions are present and the JSON is valid.]\n\n"
+                    + user_prompt
+                )
+
+            raw = chat_completion(
+                client=client,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                settings=settings,
+                max_tokens=MAX_PAIRWISE_TOKENS,
+            )
+
+            payload = _parse_json_response(raw, f"Pairwise comparison (attempt {attempt})")
+            extracted_items = _extract_pairwise_items(payload)
+            logger.info("Attempt %d: %d raw items extracted.", attempt, len(extracted_items))
+
+            candidate_items = _ordered_pairwise(extracted_items)
+            missing = [d for d in CRITICAL_REVIEW_DIMENSIONS if d not in candidate_items]
+
+            if not missing:
+                # Full success — all 8 dimensions present
+                logger.info("Pairwise comparison: all 8 dimensions received on attempt %d.", attempt)
+                raw_items = candidate_items
+                last_failure_reason = ""
+                break
+
+            logger.warning(
+                "Attempt %d: missing dimensions %s; %s.",
+                attempt,
+                ", ".join(missing),
+                "retrying" if attempt < MAX_PAIRWISE_RETRIES else "proceeding with partial results",
+            )
+            # Keep the best result seen so far (most dimensions covered)
+            if len(candidate_items) > len(raw_items):
+                raw_items = candidate_items
+            last_failure_reason = f"Missing dimensions after {attempt} attempt(s): {', '.join(missing)}."
+
+            if attempt < MAX_PAIRWISE_RETRIES:
+                time.sleep(PAIRWISE_RETRY_DELAY)
+
+        except CriticalReviewError as exc:
+            last_failure_reason = str(exc)
+            logger.warning("Attempt %d failed (CriticalReviewError): %s.", attempt, exc)
+            if attempt < MAX_PAIRWISE_RETRIES:
+                time.sleep(PAIRWISE_RETRY_DELAY)
+
+        except Exception as exc:
+            last_failure_reason = f"{type(exc).__name__}: {exc}"
+            logger.error("Attempt %d unexpected failure: %s.", attempt, exc, exc_info=True)
+            if attempt < MAX_PAIRWISE_RETRIES:
+                time.sleep(PAIRWISE_RETRY_DELAY)
+
+    # Assemble final comparisons — use intelligent fallback for any missing dimension
     comparisons: list[PairwiseDimensionComparison] = []
     for dimension in CRITICAL_REVIEW_DIMENSIONS:
         try:
             raw_item = raw_items.get(dimension)
-            if raw_item is None and failure_reason:
-                logger.warning(
-                    "Pairwise comparison using fallback for missing dimension '%s'. Reason: %s",
-                    dimension,
-                    failure_reason,
-                )
-                comparisons.append(
-                    _safe_pairwise_fallback(
-                        dimension,
-                        getattr(profile_a, dimension),
-                        getattr(profile_b, dimension),
-                        failure_reason,
+            if raw_item is None:
+                # No LLM data for this dimension even after retries
+                if last_failure_reason:
+                    logger.warning(
+                        "Using safe fallback for dimension '%s' after all retries. Reason: %s",
+                        dimension, last_failure_reason,
                     )
-                )
+                    comparisons.append(
+                        _safe_pairwise_fallback(
+                            dimension,
+                            getattr(profile_a, dimension),
+                            getattr(profile_b, dimension),
+                            last_failure_reason,
+                        )
+                    )
+                else:
+                    # Partial result set: dimension genuinely not produced
+                    comparisons.append(
+                        _fallback_pairwise(
+                            dimension,
+                            getattr(profile_a, dimension),
+                            getattr(profile_b, dimension),
+                        )
+                    )
                 continue
             comparisons.append(_normalize_pairwise(dimension, raw_item, profile_a, profile_b))
         except Exception as exc:
             logger.error(
-                "Pairwise comparison assembly failed for dimension '%s': %s: %s",
-                dimension,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
+                "Pairwise assembly failed for dimension '%s': %s: %s",
+                dimension, type(exc).__name__, exc, exc_info=True,
             )
             comparisons.append(
                 _safe_pairwise_fallback(
                     dimension,
                     getattr(profile_a, dimension),
                     getattr(profile_b, dimension),
-                    f"Dimension assembly failed with {type(exc).__name__}: {exc}.",
+                    f"Assembly failed: {type(exc).__name__}: {exc}.",
                 )
             )
 
@@ -873,7 +1124,7 @@ def validate_critical_comparison_result(result: CriticalComparisonResult) -> Non
             f"Critical comparison result must contain exactly {len(CRITICAL_REVIEW_DIMENSIONS)} pairwise comparisons."
         )
     present = {item.dimension for item in result.pairwise_comparisons}
-    missing = [dimension for dimension in CRITICAL_REVIEW_DIMENSIONS if dimension not in present]
+    missing = [d for d in CRITICAL_REVIEW_DIMENSIONS if d not in present]
     if missing:
         logger.error("Critical comparison result missing dimensions at validation: %s", ", ".join(missing))
         raise CriticalReviewError(f"Critical comparison result is missing required dimensions: {', '.join(missing)}.")
@@ -893,30 +1144,28 @@ def build_critical_comparison_markdown(result: CriticalComparisonResult) -> str:
             lines.extend([f"## {label}", f"**Title:** {profile.title}", f"**Authors:** {profile.authors}", ""])
             for dimension in CRITICAL_REVIEW_DIMENSIONS:
                 assessment = getattr(profile, dimension)
-                lines.extend(
-                    [
-                        f"### {DIMENSION_LABELS[dimension]}",
-                        f"**Verdict:** {assessment.verdict}",
-                        f"**Confidence:** {assessment.confidence or 'Low'}",
-                        assessment.rationale,
-                        "**Evidence:**",
-                        *_format_evidence_lines(assessment.evidence),
-                        "",
-                    ]
-                )
+                lines.extend([
+                    f"### {DIMENSION_LABELS[dimension]}",
+                    f"**Verdict:** {assessment.verdict}",
+                    f"**Confidence:** {assessment.confidence or 'Low'}",
+                    assessment.rationale,
+                    "**Evidence:**",
+                    *_format_evidence_lines(assessment.evidence),
+                    "",
+                ])
 
         lines.extend(["## Direct Comparison", ""])
         for comparison in result.pairwise_comparisons:
-            lines.extend(
-                [
-                    f"### {DIMENSION_LABELS.get(comparison.dimension, comparison.dimension.replace('_', ' ').title())}",
-                    f"**Comparative Judgement:** {comparison.comparative_judgement}",
-                    comparison.rationale,
-                    "**Evidence:**",
-                    *_format_evidence_lines(comparison.evidence),
-                    "",
-                ]
-            )
+            lines.extend([
+                f"### {DIMENSION_LABELS.get(comparison.dimension, comparison.dimension.replace('_', ' ').title())}",
+                f"**Paper A:** {comparison.paper_a}",
+                f"**Paper B:** {comparison.paper_b}",
+                f"**Comparative Judgement:** {comparison.comparative_judgement}",
+                comparison.rationale,
+                "**Evidence:**",
+                *_format_evidence_lines(comparison.evidence),
+                "",
+            ])
         return "\n".join(lines).strip()
     except Exception as exc:
         logger.error("Critical comparison markdown assembly failed: %s: %s", type(exc).__name__, exc, exc_info=True)

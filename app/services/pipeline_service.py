@@ -1,6 +1,15 @@
 """
 app/services/pipeline_service.py
 Simple 3-step pipeline: parse → extract sections → summarize → report.
+
+Changes vs previous version
+────────────────────────────
+• _extract_sections_from_pdf: passes BOTH marker and LLM metadata to
+  resolve_stable_metadata so the best available title/authors always wins.
+  Previously only marker metadata was used as fallback, meaning a paper
+  whose LLM extraction returned a better title would lose it.
+• run_pipeline: same four-arg resolve_stable_metadata call added for the
+  single-paper summary flow so it benefits from the same fix.
 """
 from __future__ import annotations
 import logging
@@ -44,11 +53,15 @@ def run_pipeline(
             marker_sections=marker_result.sections,
         )
 
-        # Fill title/authors from marker if LLM missed them
-        if sections.title == "Not found" and marker_result.title:
-            sections = sections.model_copy(update={"title": marker_result.title})
-        if sections.authors == "Not found" and marker_result.authors:
-            sections = sections.model_copy(update={"authors": marker_result.authors})
+        # Resolve metadata: use the best of marker OR LLM output, never lose valid data
+        stable_title, stable_authors = critical_review_service.resolve_stable_metadata(
+            marker_result.title,          # primary: marker (structural, reliable)
+            marker_result.authors,
+            sections.title,               # fallback: LLM extraction
+            sections.authors,
+        )
+        if stable_title != sections.title or stable_authors != sections.authors:
+            sections = sections.model_copy(update={"title": stable_title, "authors": stable_authors})
 
         # Step 3: Generate summary
         logger.info("Step 3/3: Generating summary...")
@@ -92,13 +105,17 @@ def _extract_sections_from_pdf(
         marker_sections=marker_result.sections,
     )
 
+    # Resolve metadata using BOTH marker and LLM output so neither source is lost.
+    # Order: marker is primary (structural extraction is more reliable for titles),
+    # LLM output is the fallback.
     stable_title, stable_authors = critical_review_service.resolve_stable_metadata(
-        marker_result.title,
+        marker_result.title,    # primary
         marker_result.authors,
-        sections.title,
+        sections.title,         # fallback
         sections.authors,
     )
     sections = sections.model_copy(update={"title": stable_title, "authors": stable_authors})
+    logger.info("%s: resolved metadata — title='%s', authors='%s'", paper_label, stable_title, stable_authors)
 
     return sections
 
