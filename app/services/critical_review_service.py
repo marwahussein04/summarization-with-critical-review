@@ -518,6 +518,8 @@ _DIMENSION_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "threats_to_validity": (
         "limitation", "limited", "bias", "generalization", "scope",
         "not evaluat", "narrow", "caveat", "concern", "only", "cannot",
+        "not tested", "not report", "lack", "missing", "omit",
+        "future work", "constraint", "trade-off", "tradeoff",
     ),
     "assumptions": (
         "assume", "assumption", "requires", "dependent on", "relies on",
@@ -584,6 +586,10 @@ def _score_candidate(sentence: str, keywords: tuple[str, ...], dimension: str = 
     if dimension == "reproducibility":
         if _RESULT_NOISE.search(sentence) and not any(k in lower for k in _SETUP_KWS_REPRO):
             score -= 12
+        # Also penalise pure result lines (accuracy/metrics) — they are not setup evidence
+        if any(k in lower for k in ("accuracy", "bleu", "f1 ", "f1-score", "rouge", "score on", "auc")):
+            if not any(k in lower for k in _SETUP_KWS_REPRO):
+                score -= 10
     return score
 
 
@@ -1012,6 +1018,36 @@ def resolve_stable_metadata(
             survivors.append(t)
         title = max(survivors, key=len) if survivors else NOT_FOUND
 
+    # ── LAST fallback: scan abstract + introduction line-by-line ─────────────
+    # Many PDF parsers lose the title field entirely but preserve it as the
+    # first non-trivial line of the abstract or introduction section.
+    if title == NOT_FOUND:
+        _TITLE_SKIP_PREFIXES = (
+            "we ", "this paper", "in this work", "in this paper",
+            "abstract", "introduction", "here we",
+        )
+        _TITLE_SKIP_CONTAINS = (
+            "accuracy", "table", "figure", "baseline", "performance",
+            "evaluate", "experiment", "section", "appendix",
+        )
+        for block in (abstract or "", (introduction or "")[:600]):
+            for line in block.splitlines():
+                line = _norm(line)
+                if not (20 <= len(line) <= 200):
+                    continue
+                ll = line.lower()
+                if any(ll.startswith(p) for p in _TITLE_SKIP_PREFIXES):
+                    continue
+                if any(x in ll for x in _TITLE_SKIP_CONTAINS):
+                    continue
+                # Must have at least one capitalised word suggesting a proper title
+                if not re.search(r"[A-Z][a-z]{2,}", line):
+                    continue
+                title = line
+                break
+            if title != NOT_FOUND:
+                break
+
     authors = _sanitize_authors(primary_authors)
     if authors == NOT_FOUND and fallback_authors:
         authors = _sanitize_authors(fallback_authors)
@@ -1333,6 +1369,9 @@ def _normalize_assessment(
             "bias", "omits", "cannot", "constraint", "trade-off", "tradeoff", "caveat",
             "suboptimal", "expensive", "restrictive", "narrow", "generalization",
             "not evaluated on", "not tested on", "scope is limited",
+            "future work", "not explore", "not address", "does not",
+            "only evaluates", "only compares", "only tested", "only on",
+            "may not", "has not", "limited scope",
         )
         extended = " ".join([
             text.lower(),
@@ -1342,7 +1381,8 @@ def _normalize_assessment(
             sections.future_work.lower(),
         ])
         has_threat = any(t in extended for t in _THREAT_TOKENS)
-        llm_ok = (_norm(assessment.verdict).lower() not in ("not enough evidence", "") and specific >= 2)
+        # Lower threshold: 1 specific item is enough if the LLM returned a non-NEE verdict
+        llm_ok = (_norm(assessment.verdict).lower() not in ("not enough evidence", "") and specific >= 1)
         if not has_threat and not llm_ok:
             return _make_insufficient(dimension)
 
@@ -1537,6 +1577,36 @@ def _fallback_pairwise(
     label    = DIMENSION_LABELS[dimension].lower()
     sa, sb   = _profile_score(a), _profile_score(b)
 
+    # ── Strengths: directional bias when score gap is clear ───────────────────
+    # Even in fallback mode, strengths can often be ranked when one paper has
+    # more specific metrics than the other (e.g. accuracy + benchmark vs. memory only).
+    if dimension == "strengths":
+        a_nee = a.verdict == NOT_ENOUGH_EVIDENCE
+        b_nee = b.verdict == NOT_ENOUGH_EVIDENCE
+        if not a_nee and not b_nee:
+            if sa >= sb + 2:
+                judgement = "Paper A appears stronger on strengths from the available evidence"
+                rationale = (
+                    f"Paper A ('{a.verdict}') has more specific strength evidence "
+                    f"than Paper B ('{b.verdict}') based on available signals."
+                )
+                return PairwiseDimensionComparison(
+                    dimension=dimension, paper_a=a.verdict, paper_b=b.verdict,
+                    comparative_judgement=_enforce_pairwise_verdict(dimension, judgement),
+                    rationale=rationale, evidence=evidence,
+                )
+            elif sb >= sa + 2:
+                judgement = "Paper B appears stronger on strengths from the available evidence"
+                rationale = (
+                    f"Paper B ('{b.verdict}') has more specific strength evidence "
+                    f"than Paper A ('{a.verdict}') based on available signals."
+                )
+                return PairwiseDimensionComparison(
+                    dimension=dimension, paper_a=a.verdict, paper_b=b.verdict,
+                    comparative_judgement=_enforce_pairwise_verdict(dimension, judgement),
+                    rationale=rationale, evidence=evidence,
+                )
+
     if dimension == "novelty":
         # Guard: if both profiles have NEE verdict, no directional ranking is justified.
         if a.verdict == NOT_ENOUGH_EVIDENCE and b.verdict == NOT_ENOUGH_EVIDENCE:
@@ -1678,6 +1748,20 @@ def _fallback_pairwise(
                     f"Paper B ('{b.verdict}') has more concrete supporting evidence "
                     f"than Paper A ('{a.verdict}'). Both are low confidence."
                 )
+        elif not a_nee and not b_nee and a.verdict == b.verdict:
+            # Both positive with the same verdict — comparable despite low confidence
+            judgement = f"Both papers show comparable {label} profiles from the available evidence."
+            rationale = (
+                f"Both papers share the verdict '{a.verdict}' for {label}, "
+                "so no directional ranking is justified even at low confidence."
+            )
+        elif not a_nee and not b_nee and abs(sa - sb) <= 1:
+            # Both positive, verdicts differ, but scores nearly equal — comparable
+            judgement = f"Both papers show comparable {label} profiles from the available evidence."
+            rationale = (
+                f"Paper A: '{a.verdict}', Paper B: '{b.verdict}'. "
+                f"Score difference is negligible ({abs(sa-sb)}), so both are treated as comparable."
+            )
         else:
             judgement = f"Insufficient evidence to rank {label} from the paper text alone."
             rationale = (
@@ -1704,14 +1788,13 @@ def _fallback_pairwise(
 
         if both_have_evidence and same_verdict:
             # Both papers share the same positive verdict — emit "comparable".
-            # Even if scores differ slightly, the verdicts agree so we call them comparable.
             judgement = f"Both papers show comparable {label} profiles from the available evidence."
             rationale = (
                 f"Both papers share the verdict '{a.verdict}' for {label}. "
                 f"Paper A confidence: {a.confidence or 'Low'}; Paper B confidence: {b.confidence or 'Low'}."
             )
         elif both_have_evidence and score_delta <= 1:
-            # Different positive verdicts but very close scores — also comparable.
+            # Verdicts may differ slightly but scores are very close — comparable.
             judgement = f"Both papers show comparable {label} profiles from the available evidence."
             rationale = (
                 f"Both papers have similar {label} levels: "
